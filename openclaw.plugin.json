@@ -1,0 +1,52 @@
+{
+  "id": "vaibot-circuit-breaker-v2",
+  "name": "VAIBot Circuit Breaker v2",
+  "description": "OpenClaw Gateway plugin that enforces VAIBot governance decisions with a circuit-breaker fallback.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mode": { "type": "string", "enum": ["enforce", "observe"], "default": "enforce" },
+      "guardBaseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:39111",
+        "description": "Local vaibot-guard service URL (skill). Primary decision source."
+      },
+      "mcpBaseUrl": {
+        "type": "string",
+        "default": "https://api.vaibot.io/v2/mcp",
+        "description": "VAIBot MCP HTTP endpoint (fallback after guard)."
+      },
+      "mcpTokenEnv": {
+        "type": "string",
+        "default": "VAIBOT_API_KEY",
+        "description": "Env var containing Bearer token for MCP endpoint."
+      },
+      "apiBaseUrl": {
+        "type": "string",
+        "default": "https://api.vaibot.io",
+        "description": "VAIBot API base URL (fallback decision source)."
+      },
+      "apiKeyEnv": {
+        "type": "string",
+        "default": "VAIBOT_API_KEY",
+        "description": "Env var that contains the VAIBOT API key (fallback decision source)."
+      },
+      "timeoutMs": { "type": "integer", "minimum": 100, "default": 15000 },
+      "failClosedOnError": { "type": "boolean", "default": true },
+      "sendToolParams": { "type": "boolean", "default": true },
+      "maxParamChars": { "type": "integer", "minimum": 1000, "default": 20000 },
+      "maxResultChars": { "type": "integer", "minimum": 1000, "default": 20000 },
+      "decisionCacheTtlMs": { "type": "integer", "minimum": 0, "default": 5000 },
+      "breakerFailureThreshold": { "type": "integer", "minimum": 1, "default": 3 },
+      "breakerWindowMs": { "type": "integer", "minimum": 1000, "default": 10000 },
+      "breakerCooldownMs": { "type": "integer", "minimum": 1000, "default": 60000 },
+      "breakerAllowlist": { "type": "array", "items": { "type": "string" }, "default": ["read", "web_fetch"] },
+      "breakerDenylist": { "type": "array", "items": { "type": "string" }, "default": ["exec", "write", "sessions_send", "message.send"] },
+      "approvalAutoRetry": { "type": "boolean", "default": true },
+      "approvalPollMs": { "type": "integer", "minimum": 1000, "default": 15000 },
+      "approvalReplayWindowMs": { "type": "integer", "minimum": 60000, "default": 1800000 }
+    }
+  }
+}

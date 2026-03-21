@@ -1,0 +1,23 @@
+{
+  "name": "@vaibot/circuit-breaker-openclaw-plugin",
+  "version": "0.1.1",
+  "type": "module",
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "README.md",
+    "scripts/**",
+    "src/**",
+    "systemd/**",
+    "references/**",
+    "assets/**"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "postinstall": "node ./scripts/postinstall.mjs"
+  },
+  "devDependencies": {
+    "vitest": "^2.0.0"
+  }
+}
