@@ -46,7 +46,13 @@
       "breakerDenylist": { "type": "array", "items": { "type": "string" }, "default": ["exec", "write", "sessions_send", "message.send"] },
       "approvalAutoRetry": { "type": "boolean", "default": true },
       "approvalPollMs": { "type": "integer", "minimum": 1000, "default": 15000 },
-      "approvalReplayWindowMs": { "type": "integer", "minimum": 60000, "default": 1800000 }
+      "approvalReplayWindowMs": { "type": "integer", "minimum": 60000, "default": 1800000 },
+      "decisionChain": {
+        "type": "array",
+        "items": { "type": "string", "enum": ["guard", "mcp", "api", "breaker", "skill"] },
+        "default": ["guard", "mcp", "api", "breaker"],
+        "description": "Decision sources in order. 'skill' is an alias for 'guard'."
+      }
     }
   }
 }

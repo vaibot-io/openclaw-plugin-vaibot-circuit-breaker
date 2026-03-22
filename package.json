@@ -13,6 +13,9 @@
     "references/**",
     "assets/**"
   ],
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
   "scripts": {
     "test": "vitest run",
     "postinstall": "node ./scripts/postinstall.mjs"
