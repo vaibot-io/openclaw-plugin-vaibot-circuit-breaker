@@ -26,7 +26,7 @@ Environment overrides:
     "entries": {
       "vaibot-circuit-breaker-v2": {
         "enabled": true,
-        "path": "/home/cybercampbell/clawd/vaibot-v2/packages/openclaw-circuitbreaker-plugin",
+        "path": "/path/to/vaibot-v2/packages/openclaw-circuitbreaker-plugin",
         "config": {
           "mode": "enforce",
           "guardBaseUrl": "http://127.0.0.1:39111",
