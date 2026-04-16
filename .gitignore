@@ -6,3 +6,5 @@ vitest.config.ts
 node_modules/
 
 SHIP.md
+.env
+.env.*

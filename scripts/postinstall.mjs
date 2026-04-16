@@ -7,6 +7,12 @@ const PKG_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '
 const PLUGIN_ID = 'vaibot-circuit-breaker-v2'
 const DEFAULT_STATE_DIR = path.join(os.homedir(), '.openclaw')
 
+// ---- Skip if OpenClaw's native installer already handled placement ----
+if (process.env.OPENCLAW_PLUGIN_INSTALL) {
+  process.stdout.write(`[vaibot] Skipping postinstall — OpenClaw native install detected.\n`)
+  process.exit(0)
+}
+
 function readJsonSafe(p) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch { return null }
 }
@@ -84,9 +90,17 @@ function main() {
 
   writeJson(configPath, config)
 
-  process.stdout.write(`[vaibot] Installed ${PLUGIN_ID} → ${pluginDest}\n`)
-  if (backupPath) process.stdout.write(`[vaibot] Backup created: ${backupPath}\n`)
-  process.stdout.write(`[vaibot] Updated ${configPath}\n`)
+  process.stdout.write(`\n`)
+  process.stdout.write(`  ✅ VAIBot Circuit Breaker v2 installed\n`)
+  process.stdout.write(`  📁 Plugin: ${pluginDest}\n`)
+  process.stdout.write(`  📝 Config: ${configPath}\n`)
+  if (backupPath) process.stdout.write(`  💾 Backup: ${backupPath}\n`)
+  process.stdout.write(`\n`)
+  process.stdout.write(`  Next steps:\n`)
+  process.stdout.write(`    1. Set VAIBOT_API_KEY in ~/.openclaw/.env (optional — needed for MCP/API fallback)\n`)
+  process.stdout.write(`    2. openclaw gateway restart\n`)
+  process.stdout.write(`    3. openclaw plugins inspect ${PLUGIN_ID}\n`)
+  process.stdout.write(`\n`)
 }
 
 try {

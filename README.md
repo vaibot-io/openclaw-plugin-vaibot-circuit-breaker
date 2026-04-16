@@ -1,24 +1,51 @@
 # @vaibot/circuit-breaker-openclaw-plugin
 
-## Install (npm)
+OpenClaw Gateway plugin that enforces VAIBot governance decisions with a multi-source decision chain and circuit-breaker fallback.
+
+**Decision chain:** vaibot-guard (local) → MCP server → VAIBot API → circuit breaker (fail-closed)
+
+## Quick Install
 
 ```bash
-npm install @vaibot/circuit-breaker-openclaw-plugin
+openclaw plugins install @vaibot/circuit-breaker-openclaw-plugin
+openclaw gateway restart
 ```
 
-Postinstall will:
-- detect OpenClaw state dir (`OPENCLAW_STATE_DIR` or `~/.openclaw`)
-- copy plugin into `${OPENCLAW_STATE_DIR}/extensions/vaibot-circuit-breaker-v2`
-- patch `openclaw.json` (or `OPENCLAW_CONFIG_PATH` if set)
+That's it. The plugin loads with sensible defaults — no config required.
 
-Environment overrides:
-- `OPENCLAW_STATE_DIR`
-- `OPENCLAW_CONFIG_PATH`
-- `OPENCLAW_EXTENSIONS_DIR`
+To verify:
 
-## Install (manual)
+```bash
+openclaw plugins inspect vaibot-circuit-breaker-v2
+```
 
-1) **Enable plugin in OpenClaw config** (`~/.openclaw/openclaw.json`):
+## Optional: Set API Key
+
+If you want MCP/API fallback (recommended), add your key:
+
+```bash
+echo 'VAIBOT_API_KEY=vb_live_...' >> ~/.openclaw/.env
+openclaw gateway restart
+```
+
+Without a key, the plugin still works — it uses the local guard skill and falls back to the circuit breaker.
+
+## Alternative: npm Install
+
+If you prefer npm (e.g., for CI or scripted setups):
+
+```bash
+npm install -g @vaibot/circuit-breaker-openclaw-plugin
+openclaw gateway restart
+```
+
+The postinstall script copies the plugin into OpenClaw's extensions directory and patches `openclaw.json` automatically.
+
+## Configuration
+
+All config is optional. Defaults are production-ready.
+
+Add overrides in `~/.openclaw/openclaw.json` under `plugins.entries.vaibot-circuit-breaker-v2.config`:
 
 ```json
 {
@@ -26,14 +53,11 @@ Environment overrides:
     "entries": {
       "vaibot-circuit-breaker-v2": {
         "enabled": true,
-        "path": "/path/to/vaibot-v2/packages/openclaw-circuitbreaker-plugin",
         "config": {
           "mode": "enforce",
           "guardBaseUrl": "http://127.0.0.1:39111",
           "mcpBaseUrl": "https://api.vaibot.io/v2/mcp",
-          "mcpTokenEnv": "VAIBOT_API_KEY",
-          "apiBaseUrl": "https://api.vaibot.io",
-          "apiKeyEnv": "VAIBOT_API_KEY"
+          "apiBaseUrl": "https://api.vaibot.io"
         }
       }
     }
@@ -41,44 +65,44 @@ Environment overrides:
 }
 ```
 
-2) **Set env vars** (in `~/.openclaw/.env` or service env):
+### Key Options
 
-```
-VAIBOT_API_KEY=vb_live_...
-VAIBOT_GUARD_TOKEN=...   # if guard requires auth
-```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `mode` | `"enforce"` | `"enforce"` blocks denied tools; `"observe"` logs only |
+| `decisionChain` | `["guard","mcp","api","breaker"]` | Decision sources in priority order |
+| `failClosedOnError` | `true` | Deny tool calls when all decision sources fail |
+| `guardBaseUrl` | `http://127.0.0.1:39111` | Local vaibot-guard service URL |
+| `mcpBaseUrl` | `https://api.vaibot.io/v2/mcp` | VAIBot MCP endpoint |
+| `apiBaseUrl` | `https://api.vaibot.io` | VAIBot API endpoint |
+| `breakerAllowlist` | `["read","web_fetch"]` | Tools allowed during breaker mode |
+| `breakerDenylist` | `["exec","write","sessions_send","message.send"]` | Tools always denied during breaker mode |
 
-3) **Restart gateway**
+### Environment Variables
 
-```bash
-openclaw gateway restart
-```
+| Variable | Purpose |
+|----------|---------|
+| `VAIBOT_API_KEY` | Bearer token for MCP + API fallback |
+| `VAIBOT_GUARD_TOKEN` | Auth token for local guard service (if required) |
 
-4) **Verify**
-Look for:
-```
-vaibot-circuitbreaker loaded (mode=..., guard=..., mcp=..., api=...)
-```
+Set these in `~/.openclaw/.env` or your service environment.
 
----
+## Upgrade from v1
 
-## Notes
-- Decision chain: **vaibot-guard → MCP → VAIBot API → circuit breaker**
-- MCP endpoint default: `https://api.vaibot.io/v2/mcp`
-
-## Config Reference (v2)
-Key options (plugin config):
-- `decisionChain`: array of sources in order. Supports `skill` (alias for `guard`), `mcp`, `api`, `breaker`. Default: `['guard','mcp','api','breaker']`.
-- `mcpMaxRetries`, `mcpRetryBaseMs`, `mcpRetryJitterMs`: MCP retry + backoff settings.
-- `breakerTelemetryAllowlist`: tools that remain allowed in breaker mode for telemetry-only flows.
-- `breakerProbeIntervalMs`: probe interval to auto-clear breaker when upstream recovers.
-
-## Upgrade Path (v1 → v2)
-- Update plugin id to `vaibot-circuit-breaker-v2` in `openclaw.json`.
-- Ensure `VAIBOT_API_KEY` is set (used for MCP + API fallbacks).
-- Add optional `decisionChain` if you want to skip any decision sources.
+1. The plugin ID changed to `vaibot-circuit-breaker-v2`
+2. Set `VAIBOT_API_KEY` (used for MCP + API fallbacks)
+3. Optionally customize `decisionChain` to skip sources you don't use
 
 ## Security Posture
-- Default mode is **enforce** with **fail-closed** on errors.
-- Breaker mode only allows explicit allowlists; exec/write/send are denied by default.
-- Guard/MCP/API outages will trip the breaker and block high‑risk operations.
+
+- Default mode: **enforce** with **fail-closed** on errors
+- Breaker mode denies `exec`, `write`, `sessions_send`, `message.send` by default
+- Only explicit allowlist tools (`read`, `web_fetch`) work during breaker mode
+- Guard/MCP/API outages trip the breaker automatically
+
+## Uninstall
+
+```bash
+openclaw plugins uninstall vaibot-circuit-breaker-v2
+openclaw gateway restart
+```
