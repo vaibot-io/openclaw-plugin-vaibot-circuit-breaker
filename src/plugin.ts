@@ -49,11 +49,10 @@ type GuardDecision = {
 type GuardToolDecideResponse = {
   ok: boolean;
   runId?: string;
-  decision?: (GuardDecision & {
-    approvalId?: string;
-    expiresAt?: string;
-    scope?: { paramsHash?: string };
-  });
+  decision?: GuardDecision;
+  approvalId?: string;
+  expiresAt?: string;
+  scope?: { paramsHash?: string };
   risk?: unknown;
   audit?: unknown;
   error?: string;
@@ -141,9 +140,28 @@ async function postJson<T>(url: string, body: unknown, timeoutMs: number, header
 }
 
 function parseMcpDecisionText(text: string): { decision?: GuardDecision; runId?: string; contentHash?: string } {
+  // Try canonical JSON first (structured MCP response)
+  try {
+    const json = JSON.parse(text);
+    if (json && typeof json === "object" && json.decision) {
+      const raw = typeof json.decision === "object" ? json.decision.decision : json.decision;
+      const reason = typeof json.decision === "object" ? json.decision.reason : undefined;
+      const normalized = String(raw).toLowerCase();
+      const decision: GuardDecision = normalized === "allow"
+        ? { decision: "allow", reason: reason ?? "MCP allow" }
+        : normalized === "approval_required" || normalized === "approve" || normalized === "approval"
+          ? { decision: "approve", reason: reason ?? "MCP approval required" }
+          : { decision: "deny", reason: reason ?? "MCP deny" };
+      return { decision, runId: json.run_id, contentHash: json.content_hash };
+    }
+  } catch {
+    // Not JSON — fall through to legacy prose parsing
+  }
+
+  // Legacy prose format (e.g. "Decision:  ALLOW\nrun_id:  run_123\ncontent_hash:  sha256:abc")
   const decisionMatch = text.match(/Decision:\s+(\w+)/i);
-  const runMatch = text.match(/run_id:\s*([\w-]+)/i);
-  const hashMatch = text.match(/content_hash:\s*([\w-]+)/i);
+  const runMatch = text.match(/run_id:\s*([\w:-]+)/i);
+  const hashMatch = text.match(/content_hash:\s*([\w:.-]+)/i);
 
   if (!decisionMatch) return {};
   const raw = decisionMatch[1].toLowerCase();
@@ -461,7 +479,11 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     const parsed = parseMcpDecisionText(String(text));
     if (!parsed.decision) throw new Error("MCP response missing decision");
 
-    return { decision: parsed.decision, raw: { run_id: parsed.runId, content_hash: parsed.contentHash } };
+    // Bug #13 fix: return parsed fields directly so callers get run_id and content_hash
+    return {
+      decision: parsed.decision,
+      raw: { run_id: parsed.runId, content_hash: parsed.contentHash },
+    };
   }
 
   async function decideWithApi(event: PluginHookBeforeToolCallEvent, ctx: PluginHookAgentContext) {
@@ -498,7 +520,10 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   }
 
   async function finalizeGuard(event: PluginHookAfterToolCallEvent, ctx: PluginHookAgentContext, guardRunId?: string) {
-    if (!guardRunId) return;
+    if (!guardRunId) {
+      api.logger.warn?.("vaibot-circuitbreaker: guard finalize skipped (no runId)");
+      return;
+    }
 
     const payload = {
       sessionId: toSessionId(ctx),
@@ -527,9 +552,15 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   }
 
   async function finalizeApi(event: PluginHookAfterToolCallEvent, ctx: PluginHookAgentContext, runId?: string) {
-    if (!runId) return;
+    if (!runId) {
+      api.logger.warn?.("vaibot-circuitbreaker: api finalize skipped (no runId)");
+      return;
+    }
     const apiKey = getApiKey();
-    if (!apiKey) return;
+    if (!apiKey) {
+      api.logger.warn?.(`vaibot-circuitbreaker: api finalize skipped (no ${cfg.apiKeyEnv})`);
+      return;
+    }
 
     const payload = {
       outcome: event.error ? "blocked" : "allowed",
@@ -594,9 +625,10 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       `expires_at=${new Date(pendingAction.expiresAt).toISOString()}`,
     ].filter(Boolean).join("\n");
 
-    if (pendingAction.intentHash && pendingAction.contentHash) {
+    // Bug #6 fix: register replay by intentHash even without contentHash
+    if (pendingAction.intentHash) {
       replayByIntentHash.set(pendingAction.intentHash, {
-        contentHash: pendingAction.contentHash,
+        contentHash: pendingAction.contentHash ?? pendingAction.intentHash,
         expiresAt: pendingAction.expiresAt,
       });
     }
@@ -608,21 +640,26 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     if (!cfg.approvalAutoRetry || pending.size === 0) return;
 
     const now = Date.now();
+    // Collect expired keys first to avoid mutation during iteration
+    const expiredKeys: string[] = [];
     for (const [key, p] of pending) {
-      if (p.expiresAt <= now) pending.delete(key);
+      if (p.expiresAt <= now) expiredKeys.push(key);
     }
+    for (const key of expiredKeys) pending.delete(key);
     if (pending.size === 0) return;
 
     // Guard approvals: if approvalId no longer pending, assume approved (best-effort)
     try {
       const res = await postJson<any>(`${cfg.guardBaseUrl}/v1/approvals/list`, {}, cfg.timeoutMs, getGuardAuthHeaders());
       const pendingIds = new Set((res?.approvals ?? []).map((a: any) => a.approvalId));
+      const resolvedGuard: PendingAction[] = [];
       for (const p of pending.values()) {
         if (!p.approvalId) continue;
-        if (!pendingIds.has(p.approvalId)) {
-          pending.delete(p.key);
-          enqueueAutoRetry(p);
-        }
+        if (!pendingIds.has(p.approvalId)) resolvedGuard.push(p);
+      }
+      for (const p of resolvedGuard) {
+        pending.delete(p.key);
+        enqueueAutoRetry(p);
       }
     } catch {
       // ignore guard poll failures
@@ -636,12 +673,14 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           authorization: `Bearer ${apiKey}`,
         });
         const approvedHashes = new Set((res?.receipts ?? []).map((r: any) => r.content_hash));
+        const resolvedApi: PendingAction[] = [];
         for (const p of pending.values()) {
           if (!p.contentHash) continue;
-          if (approvedHashes.has(p.contentHash)) {
-            pending.delete(p.key);
-            enqueueAutoRetry(p);
-          }
+          if (approvedHashes.has(p.contentHash)) resolvedApi.push(p);
+        }
+        for (const p of resolvedApi) {
+          pending.delete(p.key);
+          enqueueAutoRetry(p);
         }
       }
     } catch {
@@ -679,6 +718,8 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     }
     const replayOf = replayMatch && replayMatch.expiresAt > Date.now() ? replayMatch.contentHash : undefined;
 
+    // Bug #2 fix: when breaker is tripped, default to DENY (fail-closed).
+    // Only telemetry-allowlisted tools pass through. All others are blocked.
     if (breaker.isTripped()) {
       if (!lastTripLogged) {
         api.logger.warn?.("vaibot-circuitbreaker: breaker is TRIPPED (fail-closed)");
@@ -688,13 +729,11 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
         api.logger.info?.(`vaibot-circuitbreaker: breaker telemetry-only allowlist for ${event.toolName}`);
         return;
       }
-      if (!breaker.canAllow(event.toolName)) {
-        return {
-          block: true,
-          blockReason: `Circuit breaker active — blocked tool: ${event.toolName}`,
-        };
-      }
-      return;
+      // Fail-closed: block everything except telemetry-allowlisted tools
+      return {
+        block: true,
+        blockReason: `Circuit breaker active — blocked tool: ${event.toolName}`,
+      };
     }
 
     // Cache allow decisions
@@ -704,6 +743,8 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       return;
     }
 
+    // Bug #8 fix: "breaker" is not a decision source in the chain loop — it's handled
+    // above when the breaker is tripped. Filter it out of the iteration chain.
     const chain = cfg.decisionChain.filter((source) => source !== "breaker");
 
     for (const source of chain) {
@@ -723,19 +764,28 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             decisionCache.set(ck, { decision, meta: raw, expiresAt: Date.now() + cfg.decisionCacheTtlMs });
           }
 
+          // Bug #3 fix: Guard doesn't return content_hash, so we don't store one.
+          // The runId from Guard is used for finalize linkage.
           const key = runKey(ctx, event);
           if (raw?.runId) activeRuns.set(key, { runId: raw.runId, source: "guard", replayOf });
 
           if (decision.decision === "allow") return;
 
           if (decision.decision === "approve") {
-            const approvalId = (raw?.decision as any)?.approvalId as string | undefined;
-            const expiresAt = (raw?.decision as any)?.expiresAt as string | undefined;
-            const paramsHash = (raw?.decision as any)?.scope?.paramsHash as string | undefined;
+            // Bug #4 fix: Guard returns approvalId/expiresAt/scope at the top level of raw,
+            // NOT nested inside raw.decision
+            const approvalId = raw?.approvalId as string | undefined;
+            const expiresAt = raw?.expiresAt as string | undefined;
+            const paramsHash = raw?.scope?.paramsHash as string | undefined;
             const expMs = expiresAt ? Date.parse(expiresAt) : Date.now() + cfg.approvalReplayWindowMs;
             const decisionId = approvalId ?? raw?.runId ?? intentHash;
             const idempotencyKey = `${intentHash}:${decisionId}`;
             const pendingKey = approvalId ?? idempotencyKey;
+
+            // Bug #15 fix: populate approvedByParamsHash so guard approval replay works
+            if (approvalId && paramsHash) {
+              approvedByParamsHash.set(paramsHash, approvalId);
+            }
 
             pending.set(pendingKey, {
               key: pendingKey,
@@ -916,12 +966,17 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       }
     }
 
-    if (replayOf) {
-      replayByIntentHash.delete(intentHash);
-    }
+    // Bug #5 fix: only clean up replay record on successful allow (not on block)
+    // If we reach here, the chain was exhausted without a clear allow — don't
+    // delete the replay record so it can be retried.
 
     if (cfg.failClosedOnError) {
       return { block: true, blockReason: "VAIBot decision chain exhausted" };
+    }
+
+    // If we fall through without failClosedOnError, allow and clean up replay
+    if (replayOf) {
+      replayByIntentHash.delete(intentHash);
     }
 
     return;

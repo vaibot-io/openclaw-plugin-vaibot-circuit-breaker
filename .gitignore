@@ -1,7 +1,3 @@
-# Exclude tests from publish bundles
-**/*.test.ts
-vitest.config.ts
-
 # Ignore local build artifacts
 node_modules/
 
