@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 import { __test, CircuitBreaker } from './plugin.js'
 
 describe('helpers', () => {
@@ -248,6 +250,9 @@ describe('CircuitBreaker class', () => {
 describe('createCircuitBreaker integration', () => {
   const originalFetch = globalThis.fetch
 
+  // NOTE: autoBootstrap explicitly false and credsDir pointed at a non-existent
+  // path so tests don't trigger real /v2/bootstrap calls or pick up the
+  // developer's real ~/.vaibot/credentials.json at module init.
   const baseCfg = {
     mode: 'enforce',
     guardBaseUrl: 'http://127.0.0.1:39111',
@@ -255,6 +260,10 @@ describe('createCircuitBreaker integration', () => {
     mcpTokenEnv: 'VAIBOT_API_KEY',
     apiBaseUrl: 'https://api.vaibot.io',
     apiKeyEnv: 'VAIBOT_API_KEY',
+    dashboardUrl: 'https://www.vaibot.io',
+    autoBootstrap: false,
+    credsDir: '/tmp/vaibot-cb-test-no-creds-xyz',
+    agent: 'openclaw',
     timeoutMs: 1000,
     failClosedOnError: true,
     sendToolParams: true,
@@ -395,20 +404,277 @@ describe('createCircuitBreaker integration', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
-  // ---- Observe mode ----
+  // ---- Observe mode (runs chain, never blocks) ----
 
-  it('observe mode always passes through without calling upstreams', async () => {
+  it('observe mode runs the decision chain but never blocks on deny', async () => {
     process.env.VAIBOT_API_KEY = 'test-token'
-    const api = makeApi({ mode: 'observe' })
+    const api = makeApi({ mode: 'observe', decisionChain: ['api'] })
     const { createCircuitBreaker } = await import('./plugin.js')
     createCircuitBreaker(api as any).register()
 
-    const fetchMock = mockFetch()
+    const fetchMock = mockFetch(
+      { ok: true, run_id: 'obs_deny_1', decision: { decision: 'deny', reason: 'too risky' }, content_hash: 'sha256:obs1' },
+    )
+
     const handler = (api as any).__handlers['before_tool_call']
     const res = await handler(baseEvent, baseCtx)
+
+    // Never blocks in observe
     expect(res).toBeUndefined()
-    // Only the initial health check from register(), no decision calls
-    expect(fetchMock).toHaveBeenCalledTimes(0)
+    // But did call the API — receipt + decide event were created
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toContain('/v2/governance/decide')
+
+    // And logged the would-be enforcement
+    expect((api as any).__logs.some((l: any) => /observe.*would deny/.test(l.msg))).toBe(true)
+  })
+
+  it('observe mode allows but logs approval_required', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ mode: 'observe', decisionChain: ['api'] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    mockFetch(
+      { ok: true, run_id: 'obs_appr_1', decision: { decision: 'approval_required', reason: 'Needs review' }, content_hash: 'sha256:obs_appr' },
+    )
+
+    const handler = (api as any).__handlers['before_tool_call']
+    const res = await handler(baseEvent, baseCtx)
+
+    expect(res).toBeUndefined()
+    expect((api as any).__logs.some((l: any) => /observe.*would approve/.test(l.msg))).toBe(true)
+  })
+
+  it('observe mode bypasses the decision cache so every call is audited', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ mode: 'observe', decisionChain: ['api'], decisionCacheTtlMs: 60000 })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const fetchMock = mockFetch(
+      { ok: true, run_id: 'obs_a1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+      { ok: true, run_id: 'obs_a2', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+    )
+
+    const handler = (api as any).__handlers['before_tool_call']
+    const event = { toolName: 'read', params: { path: '/tmp/same' }, runId: 'r1', toolCallId: 't1' }
+    await handler(event, baseCtx)
+    await handler({ ...event, toolCallId: 't2' }, baseCtx)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2) // no cache short-circuit
+  })
+
+  it('observe mode logs but does not block when breaker is tripped', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ mode: 'observe', decisionChain: ['api'], breakerFailureThreshold: 1 })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    // Trip the breaker via an API failure
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network down')) as any
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    // Next call: breaker tripped — in observe, should allow
+    const fetchMock2 = vi.fn()
+    globalThis.fetch = fetchMock2 as any
+    const res = await handler({ ...baseEvent, toolCallId: 't2' }, baseCtx)
+    expect(res).toBeUndefined()
+    expect(fetchMock2).not.toHaveBeenCalled()
+    expect((api as any).__logs.some((l: any) => /observe.*breaker tripped/.test(l.msg))).toBe(true)
+  })
+
+  // ---- #2 shadow_decision preference ----
+
+  it('API path prefers shadow_decision over decision (server-observe-coerced)', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['api'] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    // Server is in observe mode, so decision is coerced to allow; shadow is the raw verdict.
+    mockFetch({
+      ok: true,
+      run_id: 'shadow_r1',
+      decision: { decision: 'allow', reason: 'observe-coerced' },
+      shadow_decision: { decision: 'deny', reason: 'policy says no' },
+      content_hash: 'sha256:shadow',
+    })
+
+    const handler = (api as any).__handlers['before_tool_call']
+    const res = await handler(baseEvent, baseCtx)
+
+    // Client enforces on the raw verdict, not the server-coerced allow.
+    expect(res?.block).toBe(true)
+    expect(res?.blockReason).toBe('policy says no')
+  })
+
+  it('API path honours server previously_approved short-circuit (decision wins over shadow)', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['api'] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    // Server says: shadow is still approval_required (policy didn't change), but
+    // decision is allow because previously_approved kicked in.
+    mockFetch({
+      ok: true,
+      run_id: 'prev_r1',
+      previously_approved: true,
+      decision: { decision: 'allow', reason: 'previously approved' },
+      shadow_decision: { decision: 'approval_required', reason: 'needs review' },
+      content_hash: 'sha256:prev',
+    })
+
+    const handler = (api as any).__handlers['before_tool_call']
+    const res = await handler(baseEvent, baseCtx)
+
+    // Plugin should allow — previously_approved is the authoritative short-circuit.
+    expect(res).toBeUndefined()
+  })
+
+  it('API decide payload includes agent_model from cfg.agent', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['api'], agent: 'openclaw' })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const fetchMock = mockFetch({
+      ok: true,
+      run_id: 'r1',
+      decision: { decision: 'allow', reason: 'ok' },
+      content_hash: 'sha256:x',
+    })
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body.agent_model).toBe('openclaw')
+  })
+
+  it('MCP decide payload includes agent_model from cfg.agent', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['mcp'], agent: 'openclaw' })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const fetchMock = mockFetch({
+      result: { content: [{ text: JSON.stringify({
+        ok: true, run_id: 'mcp_r1',
+        decision: { decision: 'allow', reason: 'ok' },
+        content_hash: 'sha256:x',
+      })}] },
+    })
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body.params.arguments.agent_model).toBe('openclaw')
+  })
+
+  it('MCP parser prefers shadow_decision when both present', () => {
+    const text = JSON.stringify({
+      ok: true,
+      run_id: 'mcp_shadow_1',
+      decision: { decision: 'allow', reason: 'observe-coerced' },
+      shadow_decision: { decision: 'approval_required', reason: 'needs review' },
+      content_hash: 'sha256:mcpshadow',
+    })
+    const out = __test.parseMcpDecisionText(text)
+    expect(out.decision?.decision).toBe('approve')
+    expect(out.decision?.reason).toBe('needs review')
+  })
+
+  // ---- #3 approved_content_hash retry short-circuit ----
+
+  it('sends approved_content_hash on retry after approval via /vaibot approve', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const registered: Array<{ name: string; handler: (ctx: any) => any }> = []
+    const baseApi = makeApi({ decisionChain: ['api'] })
+    ;(baseApi as any).registerCommand = (cmd: any) => { registered.push({ name: cmd.name, handler: cmd.handler }) }
+
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(baseApi as any).register()
+
+    const fetchMock = mockFetch(
+      // First decide → approval_required
+      { ok: true, run_id: 'api_r1', decision: { decision: 'approval_required', reason: 'Needs review' }, content_hash: 'sha256:approved_h1' },
+      // Synthetic finalize (blocked_until_approved) fired from the approve branch
+      { ok: true },
+      // /vaibot approve API call
+      { ok: true },
+      // Second decide (after approval) → server honors approved_content_hash → allow
+      { ok: true, run_id: 'api_r2', decision: { decision: 'allow', reason: 'previously approved' }, shadow_decision: { decision: 'approval_required', reason: 'Needs review' }, content_hash: 'sha256:approved_h1', previously_approved: true },
+    )
+
+    const handler = (baseApi as any).__handlers['before_tool_call']
+    const event = { toolName: 'write', params: { path: '/tmp/foo' }, runId: 'r1', toolCallId: 't1' }
+
+    // 1) first call blocks on approval_required
+    const res1 = await handler(event, baseCtx)
+    expect(res1?.block).toBe(true)
+
+    // 2) trigger /vaibot approve — populates replayByIntentHash via enqueueAutoRetry
+    const vaibotCmd = registered.find((c) => c.name === 'vaibot')!
+    await vaibotCmd.handler({ args: 'approve sha256:approved_h1' })
+
+    // 3) second call for same intent must now include approved_content_hash
+    const res2 = await handler({ ...event, toolCallId: 't2' }, baseCtx)
+    expect(res2).toBeUndefined() // allowed
+
+    // Inspect the 4th fetch (second decide) body — 2nd is the synthetic block finalize
+    const decideRetry = fetchMock.mock.calls[3]
+    const body = JSON.parse(decideRetry[1].body)
+    expect(body.approved_content_hash).toBe('sha256:approved_h1')
+  })
+
+  it('MCP decide payload carries approved_content_hash when replay is pending', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const registered: Array<{ name: string; handler: (ctx: any) => any }> = []
+    const baseApi = makeApi({ decisionChain: ['mcp'] })
+    ;(baseApi as any).registerCommand = (cmd: any) => { registered.push({ name: cmd.name, handler: cmd.handler }) }
+
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(baseApi as any).register()
+
+    const fetchMock = mockFetch(
+      // First MCP decide → approval_required
+      { result: { content: [{ text: JSON.stringify({
+        ok: true, run_id: 'mcp_r1',
+        decision: { decision: 'approval_required', reason: 'Needs review' },
+        content_hash: 'sha256:mcp_approved_h1',
+      })}] } },
+      // Synthetic finalize (blocked_until_approved) fired from the approve branch
+      { ok: true },
+      // /vaibot approve API call
+      { ok: true },
+      // Second MCP decide → allow (server honored approved_content_hash)
+      { result: { content: [{ text: JSON.stringify({
+        ok: true, run_id: 'mcp_r2',
+        decision: { decision: 'allow', reason: 'previously approved' },
+        content_hash: 'sha256:mcp_approved_h1',
+      })}] } },
+    )
+
+    const handler = (baseApi as any).__handlers['before_tool_call']
+    const event = { toolName: 'write', params: { path: '/tmp/bar' }, runId: 'r1', toolCallId: 't1' }
+
+    await handler(event, baseCtx)
+
+    const vaibotCmd = registered.find((c) => c.name === 'vaibot')!
+    await vaibotCmd.handler({ args: 'approve sha256:mcp_approved_h1' })
+
+    const res2 = await handler({ ...event, toolCallId: 't2' }, baseCtx)
+    expect(res2).toBeUndefined()
+
+    // Inspect 4th fetch (second MCP decide) — approved_content_hash is in args
+    const decideRetry = fetchMock.mock.calls[3]
+    const body = JSON.parse(decideRetry[1].body)
+    expect(body.params.arguments.approved_content_hash).toBe('sha256:mcp_approved_h1')
   })
 
   // ---- Breaker fail-closed (Bug #2) ----
@@ -507,6 +773,7 @@ describe('createCircuitBreaker integration', () => {
         decision: { decision: 'approval_required', reason: 'Needs approval' },
         content_hash: 'sha256:mcp_hash_1'
       })}] } },
+      { ok: true }, // synthetic finalize (blocked_until_approved)
     )
 
     const handler = (api as any).__handlers['before_tool_call']
@@ -525,6 +792,7 @@ describe('createCircuitBreaker integration', () => {
 
     mockFetch(
       { ok: true, run_id: 'api_1', decision: { decision: 'deny', reason: 'Policy violation' }, content_hash: 'h1' },
+      { ok: true }, // synthetic finalize (blocked)
     )
 
     const handler = (api as any).__handlers['before_tool_call']
@@ -540,12 +808,99 @@ describe('createCircuitBreaker integration', () => {
 
     mockFetch(
       { ok: true, run_id: 'api_2', decision: { decision: 'approval_required', reason: 'Needs review' }, content_hash: 'sha256:api_hash' },
+      { ok: true }, // synthetic finalize (blocked_until_approved)
     )
 
     const handler = (api as any).__handlers['before_tool_call']
     const res = await handler(baseEvent, baseCtx)
     expect(res.block).toBe(true)
     expect(res.blockReason).toContain('content_hash=sha256:api_hash')
+  })
+
+  // ---- blocked_until_approved finalize polish ----
+
+  it('API approval_required posts synthetic finalize with blocked_until_approved', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['api'] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const fetchMock = mockFetch(
+      { ok: true, run_id: 'api_r1', decision: { decision: 'approval_required', reason: 'Needs review' }, content_hash: 'sha256:h' },
+      { ok: true }, // synthetic finalize
+    )
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    const finalizeCall = fetchMock.mock.calls[1]
+    expect(finalizeCall[0]).toBe('https://api.vaibot.io/v2/governance/finalize/api_r1')
+    const body = JSON.parse(finalizeCall[1].body)
+    expect(body.outcome).toBe('blocked_until_approved')
+    expect(body.result.error).toContain('approval_required')
+    expect(body.result.error).toContain('Needs review')
+  })
+
+  it('API deny posts synthetic finalize with blocked', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['api'] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const fetchMock = mockFetch(
+      { ok: true, run_id: 'api_r2', decision: { decision: 'deny', reason: 'policy violation' }, content_hash: 'sha256:h' },
+      { ok: true }, // synthetic finalize
+    )
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    const finalizeCall = fetchMock.mock.calls[1]
+    expect(finalizeCall[0]).toBe('https://api.vaibot.io/v2/governance/finalize/api_r2')
+    const body = JSON.parse(finalizeCall[1].body)
+    expect(body.outcome).toBe('blocked')
+    expect(body.result.error).toContain('deny')
+    expect(body.result.error).toContain('policy violation')
+  })
+
+  it('MCP approval_required posts synthetic finalize with blocked_until_approved', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['mcp'] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const fetchMock = mockFetch(
+      { result: { content: [{ text: JSON.stringify({
+        ok: true, run_id: 'mcp_r1',
+        decision: { decision: 'approval_required', reason: 'Needs review' },
+        content_hash: 'sha256:h',
+      })}] } },
+      { ok: true }, // synthetic finalize
+    )
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    const finalizeCall = fetchMock.mock.calls[1]
+    expect(finalizeCall[0]).toBe('https://api.vaibot.io/v2/governance/finalize/mcp_r1')
+    const body = JSON.parse(finalizeCall[1].body)
+    expect(body.outcome).toBe('blocked_until_approved')
+  })
+
+  it('block finalize is skipped when decide returns no run_id', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['api'] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const fetchMock = mockFetch(
+      { ok: true, decision: { decision: 'deny', reason: 'no run id' } },
+    )
+
+    const handler = (api as any).__handlers['before_tool_call']
+    const res = await handler(baseEvent, baseCtx)
+    expect(res.block).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(1) // decide only, no finalize
   })
 
   // ---- Decision cache ----
@@ -721,5 +1076,319 @@ describe('createCircuitBreaker integration', () => {
     // Check that health check included auth header
     const healthCall = fetchMock.mock.calls[0]
     expect(healthCall[1]?.headers?.authorization).toBe('Bearer guard-secret')
+  })
+})
+
+describe('auto-bootstrap and claim nudge', () => {
+  const originalFetch = globalThis.fetch
+  let testCredsDir: string
+
+  // Chain is ['api'] only so bootstrap/nudge/decide are the *only* fetches
+  // — no guard-health noise to sequence around.
+  const baseCfg = {
+    mode: 'enforce',
+    guardBaseUrl: 'http://127.0.0.1:39111',
+    mcpBaseUrl: 'https://api.vaibot.io/v2/mcp',
+    mcpTokenEnv: 'VAIBOT_API_KEY',
+    apiBaseUrl: 'https://api.vaibot.io',
+    apiKeyEnv: 'VAIBOT_API_KEY',
+    dashboardUrl: 'https://www.vaibot.io',
+    autoBootstrap: true,
+    agent: 'openclaw',
+    timeoutMs: 1000,
+    failClosedOnError: true,
+    sendToolParams: true,
+    maxParamChars: 1000,
+    maxResultChars: 1000,
+    decisionCacheTtlMs: 0,
+    decisionChain: ['api'],
+    mcpMaxRetries: 0,
+    mcpRetryBaseMs: 1,
+    mcpRetryJitterMs: 0,
+    breakerFailureThreshold: 100,
+    breakerWindowMs: 60000,
+    breakerCooldownMs: 60000,
+    breakerAllowlist: [],
+    breakerDenylist: [],
+    breakerTelemetryAllowlist: [],
+    breakerProbeIntervalMs: 0,
+    approvalAutoRetry: false,
+    approvalPollMs: 60000,
+    approvalReplayWindowMs: 60000,
+  } as const
+
+  const baseEvent = { toolName: 'write', params: { path: '/tmp/boot-a' }, runId: 'r1', toolCallId: 't1' }
+  const baseCtx = { sessionId: 's-boot-1', agentId: 'a1', workspaceDir: '/tmp', sessionKey: 'sk1' }
+
+  function makeApi(overrides: any = {}) {
+    const handlers: Record<string, any> = {}
+    const logs: { level: string; msg: string }[] = []
+    return {
+      pluginConfig: { ...baseCfg, credsDir: testCredsDir, ...overrides },
+      runtime: {
+        state: { resolveStateDir: () => '/tmp' },
+        config: {
+          writeConfigFile: () => {},
+          loadConfig: () => ({})
+        },
+        system: { enqueueSystemEvent: () => {} }
+      },
+      logger: {
+        info: (msg: string) => logs.push({ level: 'info', msg }),
+        warn: (msg: string) => logs.push({ level: 'warn', msg }),
+        error: (msg: string) => logs.push({ level: 'error', msg }),
+      },
+      on: (name: string, fn: any) => { handlers[name] = fn },
+      registerCommand: () => {},
+      __handlers: handlers,
+      __logs: logs,
+    }
+  }
+
+  function mockFetch(...responses: any[]) {
+    const fn = vi.fn()
+    for (const r of responses) {
+      fn.mockResolvedValueOnce({
+        text: async () => JSON.stringify(r),
+        status: 200,
+      })
+    }
+    globalThis.fetch = fn as any
+    return fn
+  }
+
+  beforeEach(() => {
+    testCredsDir = `/tmp/vaibot-cb-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    delete process.env.VAIBOT_API_KEY
+    try { fs.rmSync(testCredsDir, { recursive: true, force: true }) } catch { /* ignore */ }
+  })
+
+  it('bootstraps when no API key is resolvable and autoBootstrap is true', async () => {
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    const fetchMock = mockFetch(
+      { api_key: 'boot_k1', account_id: 'acct_1', user_id: 'user_1', wallet_address: '0xabc', wallet_network: 'base-sepolia' },
+      { claimed: false }, // nudge
+      { ok: true, run_id: 'r1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+    )
+
+    createCircuitBreaker(api as any).register()
+
+    const handler = (api as any).__handlers['before_tool_call']
+    const res = await handler(baseEvent, baseCtx)
+
+    expect(res).toBeUndefined()
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.vaibot.io/v2/bootstrap')
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body.agent).toBe('openclaw')
+    expect(typeof body.fingerprint).toBe('string')
+    expect(body.fingerprint).toHaveLength(64) // sha256 hex
+  })
+
+  it('skips bootstrap when VAIBOT_API_KEY env is set', async () => {
+    process.env.VAIBOT_API_KEY = 'env-key-1'
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    const fetchMock = mockFetch(
+      { ok: true, run_id: 'r1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+    )
+
+    createCircuitBreaker(api as any).register()
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    // Only decide — no /v2/bootstrap, no /v2/accounts/me
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0][0]).toContain('/v2/governance/decide')
+  })
+
+  it('skips bootstrap when saved credentials already exist', async () => {
+    fs.mkdirSync(testCredsDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(testCredsDir, 'credentials.json'),
+      JSON.stringify({ api_key: 'saved_k1', account_id: 'saved_acct' }),
+    )
+
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    const fetchMock = mockFetch(
+      { claimed: true }, // nudge (uses saved key)
+      { ok: true, run_id: 'r1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+    )
+
+    createCircuitBreaker(api as any).register()
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    const urls = fetchMock.mock.calls.map((c: any[]) => c[0])
+    expect(urls.some((u: string) => u.includes('/v2/bootstrap'))).toBe(false)
+    expect(urls[0]).toContain('/v2/accounts/me')
+    expect(urls[1]).toContain('/v2/governance/decide')
+
+    // Decide must use the saved key
+    const decideCall = fetchMock.mock.calls[1]
+    expect(decideCall[1].headers.authorization).toBe('Bearer saved_k1')
+  })
+
+  it('logs a warning and continues when bootstrap network call fails', async () => {
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    const fetchMock = vi.fn().mockRejectedValue(new Error('network down'))
+    globalThis.fetch = fetchMock as any
+
+    createCircuitBreaker(api as any).register()
+
+    const handler = (api as any).__handlers['before_tool_call']
+    const res = await handler(baseEvent, baseCtx)
+
+    // No key → decide throws → chain exhausted → fail-closed block
+    expect(res?.block).toBe(true)
+    expect((api as any).__logs.some((l: any) => l.level === 'warn' && /bootstrap failed/.test(l.msg))).toBe(true)
+  })
+
+  it('warns when bootstrap response has bootstrapped:false without api_key', async () => {
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    mockFetch({ bootstrapped: false })
+
+    createCircuitBreaker(api as any).register()
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    expect((api as any).__logs.some((l: any) =>
+      l.level === 'warn' && /already provisioned but no api_key returned/.test(l.msg)
+    )).toBe(true)
+  })
+
+  it('saves bootstrapped credentials to credsDir/credentials.json', async () => {
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    mockFetch(
+      { api_key: 'boot_k2', account_id: 'acct_2', user_id: 'u2', wallet_address: '0xdef', wallet_network: 'base-sepolia' },
+      { claimed: true },
+      { ok: true, run_id: 'r1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+    )
+
+    createCircuitBreaker(api as any).register()
+
+    // Awaiting the handler guarantees the bootstrap promise has resolved.
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    const credsPath = path.join(testCredsDir, 'credentials.json')
+    expect(fs.existsSync(credsPath)).toBe(true)
+    const saved = JSON.parse(fs.readFileSync(credsPath, 'utf-8'))
+    expect(saved.api_key).toBe('boot_k2')
+    expect(saved.account_id).toBe('acct_2')
+    expect(saved.wallet_address).toBe('0xdef')
+    expect(saved.api_url).toBe('https://api.vaibot.io')
+    expect(typeof saved.bootstrapped_at).toBe('string')
+  })
+
+  it('uses bootstrapped api_key for subsequent decide calls', async () => {
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    const fetchMock = mockFetch(
+      { api_key: 'boot_k3' },
+      { claimed: true },
+      { ok: true, run_id: 'r1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+    )
+
+    createCircuitBreaker(api as any).register()
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    // 3rd call is the decide — should carry the bootstrapped key
+    const decideCall = fetchMock.mock.calls[2]
+    expect(decideCall[0]).toContain('/v2/governance/decide')
+    expect(decideCall[1].headers.authorization).toBe('Bearer boot_k3')
+  })
+
+  it('emits claim nudge once per session when claimed:false', async () => {
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    const fetchMock = mockFetch(
+      { api_key: 'boot_k4' },
+      { claimed: false },
+      { ok: true, run_id: 'r1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+      { ok: true, run_id: 'r2', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h2' },
+    )
+
+    createCircuitBreaker(api as any).register()
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+    await handler({ ...baseEvent, toolCallId: 't2' }, baseCtx)
+
+    // Only one /v2/accounts/me call across the two handler invocations.
+    const nudgeCalls = fetchMock.mock.calls.filter((c: any[]) => String(c[0]).includes('/v2/accounts/me'))
+    expect(nudgeCalls).toHaveLength(1)
+
+    const claimLogs = (api as any).__logs.filter((l: any) =>
+      l.level === 'info' && /claim your account/i.test(l.msg)
+    )
+    expect(claimLogs).toHaveLength(1)
+    expect(claimLogs[0].msg).toContain('api_key=boot_k4')
+  })
+
+  it('suppresses claim nudge log when claimed:true', async () => {
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    mockFetch(
+      { api_key: 'boot_k5' },
+      { claimed: true },
+      { ok: true, run_id: 'r1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+    )
+
+    createCircuitBreaker(api as any).register()
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    const claimLogs = (api as any).__logs.filter((l: any) =>
+      l.level === 'info' && /claim your account/i.test(l.msg)
+    )
+    expect(claimLogs).toHaveLength(0)
+  })
+
+  it('includes provisioned account fingerprint log with claim URL on bootstrap', async () => {
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+
+    mockFetch(
+      { api_key: 'boot_k6', wallet_address: '0xbeef', wallet_network: 'base-sepolia' },
+      { claimed: true },
+      { ok: true, run_id: 'r1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' },
+    )
+
+    createCircuitBreaker(api as any).register()
+
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx)
+
+    const provisionedLogs = (api as any).__logs.filter((l: any) =>
+      l.level === 'info' && /account provisioned/.test(l.msg)
+    )
+    expect(provisionedLogs).toHaveLength(1)
+    expect(provisionedLogs[0].msg).toContain('0xbeef')
+    expect(provisionedLogs[0].msg).toContain('base-sepolia')
+    expect(provisionedLogs[0].msg).toContain('api_key=boot_k6')
   })
 })

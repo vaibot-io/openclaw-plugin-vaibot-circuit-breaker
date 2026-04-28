@@ -5,6 +5,10 @@ import type {
   PluginHookBeforeToolCallEvent,
   PluginHookBeforeToolCallResult,
 } from "openclaw/plugin-sdk";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { hostname, userInfo, homedir } from "node:os";
+import { join } from "node:path";
 
 // ---- Types ----
 
@@ -19,6 +23,10 @@ type PluginConfig = {
   mcpTokenEnv?: string;
   apiBaseUrl?: string;
   apiKeyEnv?: string;
+  dashboardUrl?: string;
+  autoBootstrap?: boolean;
+  credsDir?: string;
+  agent?: string;
   timeoutMs?: number;
   failClosedOnError?: boolean;
   sendToolParams?: boolean;
@@ -39,6 +47,25 @@ type PluginConfig = {
   approvalAutoRetry?: boolean;
   approvalPollMs?: number;
   approvalReplayWindowMs?: number;
+};
+
+type SavedCredentials = {
+  api_key?: string;
+  account_id?: string;
+  user_id?: string;
+  wallet_address?: string;
+  wallet_network?: string;
+  api_url?: string;
+  bootstrapped_at?: string;
+};
+
+type BootstrapResponse = {
+  api_key?: string;
+  account_id?: string;
+  user_id?: string;
+  wallet_address?: string;
+  wallet_network?: string;
+  bootstrapped?: boolean;
 };
 
 type GuardDecision = {
@@ -143,9 +170,13 @@ function parseMcpDecisionText(text: string): { decision?: GuardDecision; runId?:
   // Try canonical JSON first (structured MCP response)
   try {
     const json = JSON.parse(text);
-    if (json && typeof json === "object" && json.decision) {
-      const raw = typeof json.decision === "object" ? json.decision.decision : json.decision;
-      const reason = typeof json.decision === "object" ? json.decision.reason : undefined;
+    if (json && typeof json === "object" && (json.decision || json.shadow_decision)) {
+      // Prefer shadow_decision (raw policy verdict) over decision (server-observe-coerced).
+      // This mirrors the Claude Code pre-hook's posture — the raw verdict is the legal truth;
+      // the coerced decision exists so clients without shadow awareness don't block in observe.
+      const source = json.shadow_decision ?? json.decision;
+      const raw = typeof source === "object" ? source.decision : source;
+      const reason = typeof source === "object" ? source.reason : undefined;
       const normalized = String(raw).toLowerCase();
       const decision: GuardDecision = normalized === "allow"
         ? { decision: "allow", reason: reason ?? "MCP allow" }
@@ -236,6 +267,35 @@ function toSessionId(ctx: PluginHookAgentContext): string {
   return String(ctx.sessionId || ctx.sessionKey || "unknown-session");
 }
 
+// ---- Credentials (shared with Claude Code plugin at ~/.vaibot/credentials.json) ----
+
+function loadSavedCredentials(credsDir: string): SavedCredentials | null {
+  try {
+    const file = join(credsDir, "credentials.json");
+    if (existsSync(file)) return JSON.parse(readFileSync(file, "utf-8")) as SavedCredentials;
+  } catch { /* corrupt / unreadable — ignore */ }
+  return null;
+}
+
+function saveCredentials(credsDir: string, creds: SavedCredentials): void {
+  try {
+    mkdirSync(credsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(credsDir, "credentials.json"), JSON.stringify(creds, null, 2), { mode: 0o600 });
+  } catch { /* best-effort */ }
+}
+
+/**
+ * Forensic correlation fingerprint — NOT machine attestation. Matches the Claude
+ * Code plugin's algorithm so the same user/host/cwd maps to the same account
+ * whichever plugin bootstraps first. Server uses this for bootstrap idempotency.
+ */
+function getFingerprint(): string {
+  const user = userInfo().username;
+  const host = hostname();
+  const cwd = process.cwd();
+  return createHash("sha256").update(`${user}@${host}:${cwd}`).digest("hex");
+}
+
 function resolveConfig(api: OpenClawPluginApi): Required<PluginConfig> {
   const cfg = (api.pluginConfig ?? {}) as PluginConfig;
 
@@ -246,6 +306,10 @@ function resolveConfig(api: OpenClawPluginApi): Required<PluginConfig> {
     mcpTokenEnv: String(cfg.mcpTokenEnv ?? "VAIBOT_API_KEY"),
     apiBaseUrl: String(cfg.apiBaseUrl ?? process.env.VAIBOT_API_BASE_URL ?? "https://api.vaibot.io").replace(/\/$/, ""),
     apiKeyEnv: String(cfg.apiKeyEnv ?? "VAIBOT_API_KEY"),
+    dashboardUrl: String(cfg.dashboardUrl ?? process.env.VAIBOT_DASHBOARD_URL ?? "https://www.vaibot.io").replace(/\/$/, ""),
+    autoBootstrap: cfg.autoBootstrap !== false,
+    credsDir: String(cfg.credsDir ?? process.env.VAIBOT_CREDS_DIR ?? join(homedir(), ".vaibot")),
+    agent: String(cfg.agent ?? "openclaw"),
     timeoutMs: Number.isFinite(cfg.timeoutMs) ? Number(cfg.timeoutMs) : 15000,
     failClosedOnError: cfg.failClosedOnError !== false,
     sendToolParams: cfg.sendToolParams !== false,
@@ -337,6 +401,12 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   const stateDir = api.runtime.state.resolveStateDir();
   const statePath = `${stateDir}/vaibot-circuit-breaker-v2.json`;
   let lastTripLogged = false;
+
+  // Auto-bootstrap state. Seed from saved credentials so restarts reuse the same account.
+  const initialCreds = loadSavedCredentials(cfg.credsDir);
+  let bootstrappedKey: string | null = initialCreds?.api_key ? String(initialCreds.api_key) : null;
+  let bootstrapPromise: Promise<void> | null = null;
+  const nudgedSessions = new Set<string>();
 
   function persistBreakerState() {
     try {
@@ -440,22 +510,115 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   }
 
   function getApiKey(): string {
-    const name = cfg.apiKeyEnv;
-    return String(process.env[name] ?? "").trim();
+    const fromEnv = String(process.env[cfg.apiKeyEnv] ?? "").trim();
+    if (fromEnv) return fromEnv;
+    return bootstrappedKey ?? "";
   }
 
   function getMcpToken(): string {
-    const name = cfg.mcpTokenEnv;
-    return String(process.env[name] ?? "").trim();
+    const fromEnv = String(process.env[cfg.mcpTokenEnv] ?? "").trim();
+    if (fromEnv) return fromEnv;
+    return bootstrappedKey ?? "";
   }
 
-  async function decideWithMcp(event: PluginHookBeforeToolCallEvent, ctx: PluginHookAgentContext) {
+  /**
+   * Auto-bootstrap a free-tier account on first run. No-ops if autoBootstrap is
+   * disabled, or if a key is already resolvable via env or saved credentials.
+   * Errors are logged but never rethrown — a missing key is handled downstream
+   * by the usual failClosedOnError path.
+   */
+  async function bootstrap(): Promise<void> {
+    if (!cfg.autoBootstrap) return;
+    if (getApiKey()) return;
+
+    const fingerprint = getFingerprint();
+    let res: BootstrapResponse;
+    try {
+      res = await postJson<BootstrapResponse>(
+        `${cfg.apiBaseUrl}/v2/bootstrap`,
+        { fingerprint, agent: cfg.agent },
+        cfg.timeoutMs,
+      );
+    } catch (err) {
+      api.logger.warn?.(`vaibot-circuitbreaker: bootstrap failed (${String(err)})`);
+      return;
+    }
+
+    if (res?.api_key) {
+      bootstrappedKey = String(res.api_key);
+      saveCredentials(cfg.credsDir, {
+        api_key: res.api_key,
+        account_id: res.account_id,
+        user_id: res.user_id,
+        wallet_address: res.wallet_address,
+        wallet_network: res.wallet_network,
+        api_url: cfg.apiBaseUrl,
+        bootstrapped_at: new Date().toISOString(),
+      });
+      const claimUrl = `${cfg.dashboardUrl}/claim?api_key=${encodeURIComponent(res.api_key)}`;
+      api.logger.info?.(
+        `vaibot-circuitbreaker: account provisioned` +
+          (res.wallet_address ? ` (identity ${res.wallet_address} on ${res.wallet_network})` : "") +
+          `. Claim to approve from the dashboard: ${claimUrl}`,
+      );
+      return;
+    }
+
+    if (res?.bootstrapped === false) {
+      api.logger.warn?.(
+        `vaibot-circuitbreaker: account already provisioned but no api_key returned. ` +
+          `Set ${cfg.apiKeyEnv} manually or check ${join(cfg.credsDir, "credentials.json")}.`,
+      );
+      return;
+    }
+
+    api.logger.warn?.(
+      `vaibot-circuitbreaker: bootstrap returned no api_key — skipping (response: ${JSON.stringify(res).slice(0, 200)})`,
+    );
+  }
+
+  /**
+   * One-shot per-session nudge pointing at the claim URL when the account is
+   * still synthetic (`claimed:false`). Best-effort; never blocks tool calls.
+   */
+  async function maybeNudgeUnclaimed(sessionId: string): Promise<void> {
+    if (nudgedSessions.has(sessionId)) return;
+    // Only nudge when running on a bootstrapped key — env-provided keys are
+    // the user's own and already associated with a claimed account.
+    const envKey = String(process.env[cfg.apiKeyEnv] ?? "").trim();
+    if (envKey) return;
+    const apiKey = bootstrappedKey;
+    if (!apiKey) return;
+    try {
+      const res = await getJson<{ claimed?: boolean }>(
+        `${cfg.apiBaseUrl}/v2/accounts/me`,
+        cfg.timeoutMs,
+        { authorization: `Bearer ${apiKey}` },
+      );
+      nudgedSessions.add(sessionId);
+      if (res?.claimed === false) {
+        const claimUrl = `${cfg.dashboardUrl}/claim?api_key=${encodeURIComponent(apiKey)}`;
+        api.logger.info?.(
+          `vaibot-circuitbreaker: claim your account to approve from the dashboard: ${claimUrl}`,
+        );
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  async function decideWithMcp(
+    event: PluginHookBeforeToolCallEvent,
+    ctx: PluginHookAgentContext,
+    approvedContentHash?: string,
+  ) {
     const token = getMcpToken();
     if (!token) throw new Error(`Missing ${cfg.mcpTokenEnv} for MCP endpoint`);
 
     const args: any = {
       session_id: String(ctx.sessionId || ctx.sessionKey || "unknown"),
       agent_id: String(ctx.agentId || "unknown"),
+      agent_model: cfg.agent,
       tool: event.toolName,
       params: cfg.sendToolParams ? safeJson(event.params, cfg.maxParamChars) : undefined,
       workspace_dir: ctx.workspaceDir,
@@ -463,6 +626,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       target: (event.params as any)?.url ?? (event.params as any)?.path,
       cwd: (event.params as any)?.cwd,
     };
+    if (approvedContentHash) args.approved_content_hash = approvedContentHash;
 
     const payload = {
       jsonrpc: "2.0",
@@ -486,13 +650,18 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     };
   }
 
-  async function decideWithApi(event: PluginHookBeforeToolCallEvent, ctx: PluginHookAgentContext) {
+  async function decideWithApi(
+    event: PluginHookBeforeToolCallEvent,
+    ctx: PluginHookAgentContext,
+    approvedContentHash?: string,
+  ) {
     const apiKey = getApiKey();
     if (!apiKey) throw new Error(`Missing ${cfg.apiKeyEnv} for VAIBot API`);
 
     const payload: any = {
       session_id: String(ctx.sessionId || ctx.sessionKey || "unknown"),
       agent_id: String(ctx.agentId || "unknown"),
+      agent_model: cfg.agent,
       tool: event.toolName,
       params: cfg.sendToolParams ? safeJson(event.params, cfg.maxParamChars) : undefined,
       workspace_dir: ctx.workspaceDir,
@@ -502,19 +671,28 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
         cwd: (event.params as any)?.cwd,
       },
     };
+    if (approvedContentHash) payload.approved_content_hash = approvedContentHash;
 
-    const raw = await postJson<VaibotApiResponse>(
+    const raw = await postJson<VaibotApiResponse & { shadow_decision?: VaibotApiDecision }>(
       `${cfg.apiBaseUrl}/v2/governance/decide`,
       payload,
       cfg.timeoutMs,
       { authorization: `Bearer ${apiKey}` },
     );
 
-    const decision: GuardDecision = raw?.decision?.decision === "approval_required"
-      ? { decision: "approve", reason: raw?.decision?.reason }
-      : (raw?.decision?.decision === "allow"
-        ? { decision: "allow", reason: raw?.decision?.reason }
-        : { decision: "deny", reason: raw?.decision?.reason });
+    // Prefer shadow_decision (raw policy verdict) over decision (server-observe-coerced).
+    // If the server short-circuited via previously_approved, decision will be 'allow' even
+    // when shadow_decision is 'approval_required' — we want the effective allow in that case.
+    const previouslyApproved = Boolean((raw as any)?.previously_approved);
+    const effective = previouslyApproved ? raw?.decision : (raw?.shadow_decision ?? raw?.decision);
+    const kind = effective?.decision;
+    const reason = effective?.reason;
+
+    const decision: GuardDecision = kind === "approval_required"
+      ? { decision: "approve", reason }
+      : kind === "allow"
+        ? { decision: "allow", reason }
+        : { decision: "deny", reason };
 
     return { decision, raw };
   }
@@ -548,6 +726,29 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       await postJson(`${cfg.guardBaseUrl}/v1/finalize/tool`, payload, cfg.timeoutMs, getGuardAuthHeaders());
     } catch (err) {
       api.logger.warn?.(`vaibot-circuitbreaker: guard finalize failed (${String(err)})`);
+    }
+  }
+
+  /**
+   * Synthetic finalize for the block paths in onBeforeToolCall. When we return
+   * `{ block: true }` the gateway never fires `after_tool_call`, so the server
+   * would be left with a dangling decide. Posting finalize here closes the loop
+   * and lets receipts distinguish `blocked_until_approved` (awaiting human) from
+   * `blocked` (hard deny). Mirrors Claude Code's bestEffortFinalize.
+   */
+  async function finalizeBlock(runId: string | undefined, outcome: "blocked" | "blocked_until_approved", summary: string) {
+    if (!runId) return;
+    const apiKey = getApiKey();
+    if (!apiKey) return;
+    try {
+      await postJson(
+        `${cfg.apiBaseUrl}/v2/governance/finalize/${encodeURIComponent(runId)}`,
+        { outcome, result: { error: summary } },
+        cfg.timeoutMs,
+        { authorization: `Bearer ${apiKey}` },
+      );
+    } catch (err) {
+      api.logger.warn?.(`vaibot-circuitbreaker: block finalize failed (${String(err)})`);
     }
   }
 
@@ -625,10 +826,13 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       `expires_at=${new Date(pendingAction.expiresAt).toISOString()}`,
     ].filter(Boolean).join("\n");
 
-    // Bug #6 fix: register replay by intentHash even without contentHash
-    if (pendingAction.intentHash) {
+    // Only register a replay pointer when we have a real content_hash. The server
+    // short-circuit (approved_content_hash) looks it up as a receipts row, so an
+    // intent-hash fallback would miss and re-run policy. Guard-only approvals
+    // (no content_hash) use approvedByParamsHash locally instead.
+    if (pendingAction.intentHash && pendingAction.contentHash) {
       replayByIntentHash.set(pendingAction.intentHash, {
-        contentHash: pendingAction.contentHash ?? pendingAction.intentHash,
+        contentHash: pendingAction.contentHash,
         expiresAt: pendingAction.expiresAt,
       });
     }
@@ -707,9 +911,19 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     event: PluginHookBeforeToolCallEvent,
     ctx: PluginHookAgentContext,
   ): Promise<PluginHookBeforeToolCallResult | void> {
-    if (cfg.mode === "observe") {
-      return;
+    // Wait for any in-flight auto-bootstrap so the decision chain sees a
+    // resolved API key. Errors are already logged inside bootstrap().
+    if (bootstrapPromise) {
+      try { await bootstrapPromise; } catch { /* logged inside */ }
     }
+
+    // Fire-and-forget claim nudge — independent of the chain outcome.
+    maybeNudgeUnclaimed(toSessionId(ctx)).catch(() => { /* best-effort */ });
+
+    // In observe mode we still run the full chain — the point is to produce
+    // the same decide/finalize audit trail enforce produces, just without
+    // ever blocking the tool. Early-return would drop all receipts.
+    const observeOnly = cfg.mode === "observe";
 
     const intentHash = await buildIntentHash(event);
     const replayMatch = replayByIntentHash.get(intentHash);
@@ -718,29 +932,43 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     }
     const replayOf = replayMatch && replayMatch.expiresAt > Date.now() ? replayMatch.contentHash : undefined;
 
+    function observeAllow(source: string, decision: GuardDecision, extras: string = ""): void {
+      api.logger.info?.(
+        `vaibot-circuitbreaker [observe]: ${source} would ${decision.decision} ${event.toolName}` +
+          (decision.reason ? ` — ${decision.reason}` : "") +
+          (extras ? ` ${extras}` : ""),
+      );
+    }
+
     // Bug #2 fix: when breaker is tripped, default to DENY (fail-closed).
     // Only telemetry-allowlisted tools pass through. All others are blocked.
+    // In observe mode the breaker is informational — log and allow.
     if (breaker.isTripped()) {
       if (!lastTripLogged) {
-        api.logger.warn?.("vaibot-circuitbreaker: breaker is TRIPPED (fail-closed)");
+        api.logger.warn?.(`vaibot-circuitbreaker: breaker is TRIPPED (${observeOnly ? "observe/log-only" : "fail-closed"})`);
         lastTripLogged = true;
       }
       if (cfg.breakerTelemetryAllowlist.includes(event.toolName)) {
         api.logger.info?.(`vaibot-circuitbreaker: breaker telemetry-only allowlist for ${event.toolName}`);
         return;
       }
-      // Fail-closed: block everything except telemetry-allowlisted tools
+      if (observeOnly) {
+        api.logger.info?.(`vaibot-circuitbreaker [observe]: breaker tripped — would block ${event.toolName}`);
+        return;
+      }
       return {
         block: true,
         blockReason: `Circuit breaker active — blocked tool: ${event.toolName}`,
       };
     }
 
-    // Cache allow decisions
+    // Cache allow decisions (skip in observe so every call produces a receipt).
     const ck = cacheKey(event);
-    const cached = decisionCache.get(ck);
-    if (cached && cached.expiresAt > Date.now() && cached.decision.decision === "allow") {
-      return;
+    if (!observeOnly) {
+      const cached = decisionCache.get(ck);
+      if (cached && cached.expiresAt > Date.now() && cached.decision.decision === "allow") {
+        return;
+      }
     }
 
     // Bug #8 fix: "breaker" is not a decision source in the chain loop — it's handled
@@ -760,7 +988,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           lastTripLogged = false;
           api.logger.info?.(`vaibot-circuitbreaker: decision source=guard decision=${decision.decision}`);
 
-          if (decision.decision === "allow" && cfg.decisionCacheTtlMs > 0) {
+          if (decision.decision === "allow" && cfg.decisionCacheTtlMs > 0 && !observeOnly) {
             decisionCache.set(ck, { decision, meta: raw, expiresAt: Date.now() + cfg.decisionCacheTtlMs });
           }
 
@@ -769,9 +997,13 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           const key = runKey(ctx, event);
           if (raw?.runId) activeRuns.set(key, { runId: raw.runId, source: "guard", replayOf });
 
-          if (decision.decision === "allow") return;
+          if (decision.decision === "allow") {
+            if (replayOf) replayByIntentHash.delete(intentHash);
+            return;
+          }
 
           if (decision.decision === "approve") {
+            if (observeOnly) { observeAllow("guard", decision); return; }
             // Bug #4 fix: Guard returns approvalId/expiresAt/scope at the top level of raw,
             // NOT nested inside raw.decision
             const approvalId = raw?.approvalId as string | undefined;
@@ -813,6 +1045,8 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             };
           }
 
+          // deny
+          if (observeOnly) { observeAllow("guard", decision); return; }
           return {
             block: true,
             blockReason: decision.reason || `Denied by VAIBot-Guard for tool: ${event.toolName}`,
@@ -832,23 +1066,27 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
 
       if (source === "mcp") {
         try {
-          const { decision, raw } = await decideWithMcp(event, ctx);
+          const { decision, raw } = await decideWithMcp(event, ctx, replayOf);
           breaker.recordSuccess();
           persistBreakerState();
           if (lastTripLogged) api.logger.info?.("vaibot-circuitbreaker: breaker CLEARED (mcp)");
           lastTripLogged = false;
           api.logger.info?.(`vaibot-circuitbreaker: decision source=mcp decision=${decision.decision}`);
 
-          if (decision.decision === "allow" && cfg.decisionCacheTtlMs > 0) {
+          if (decision.decision === "allow" && cfg.decisionCacheTtlMs > 0 && !observeOnly) {
             decisionCache.set(ck, { decision, meta: raw, expiresAt: Date.now() + cfg.decisionCacheTtlMs });
           }
 
           const key = runKey(ctx, event);
           if (raw?.run_id) activeRuns.set(key, { runId: raw.run_id, source: "mcp", contentHash: raw?.content_hash, replayOf });
 
-          if (decision.decision === "allow") return;
+          if (decision.decision === "allow") {
+            if (replayOf) replayByIntentHash.delete(intentHash);
+            return;
+          }
 
           if (decision.decision === "approve") {
+            if (observeOnly) { observeAllow("mcp", decision, raw?.content_hash ? `content_hash=${raw.content_hash}` : ""); return; }
             const contentHash = raw?.content_hash;
             const decisionId = contentHash ?? raw?.run_id ?? intentHash;
             const idempotencyKey = `${intentHash}:${decisionId}`;
@@ -869,6 +1107,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
               expiresAt: Date.now() + cfg.approvalReplayWindowMs,
             });
 
+            activeRuns.delete(key);
+            await finalizeBlock(raw?.run_id, "blocked_until_approved", `Plugin enforced: approval_required — ${decision.reason ?? event.toolName}`);
+
             return {
               block: true,
               blockReason:
@@ -878,6 +1119,10 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             };
           }
 
+          // deny
+          if (observeOnly) { observeAllow("mcp", decision); return; }
+          activeRuns.delete(key);
+          await finalizeBlock(raw?.run_id, "blocked", `Plugin enforced: deny — ${decision.reason ?? event.toolName}`);
           return {
             block: true,
             blockReason: decision.reason || `Denied by VAIBot MCP for tool: ${event.toolName}`,
@@ -897,23 +1142,27 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
 
       if (source === "api") {
         try {
-          const { decision, raw } = await decideWithApi(event, ctx);
+          const { decision, raw } = await decideWithApi(event, ctx, replayOf);
           breaker.recordSuccess();
           persistBreakerState();
           if (lastTripLogged) api.logger.info?.("vaibot-circuitbreaker: breaker CLEARED (api)");
           lastTripLogged = false;
           api.logger.info?.(`vaibot-circuitbreaker: decision source=api decision=${decision.decision}`);
 
-          if (decision.decision === "allow" && cfg.decisionCacheTtlMs > 0) {
+          if (decision.decision === "allow" && cfg.decisionCacheTtlMs > 0 && !observeOnly) {
             decisionCache.set(ck, { decision, meta: raw, expiresAt: Date.now() + cfg.decisionCacheTtlMs });
           }
 
           const key = runKey(ctx, event);
           if (raw?.run_id) activeRuns.set(key, { runId: raw.run_id, source: "api", contentHash: raw?.content_hash, replayOf });
 
-          if (decision.decision === "allow") return;
+          if (decision.decision === "allow") {
+            if (replayOf) replayByIntentHash.delete(intentHash);
+            return;
+          }
 
           if (decision.decision === "approve") {
+            if (observeOnly) { observeAllow("api", decision, raw?.content_hash ? `content_hash=${raw.content_hash}` : ""); return; }
             const contentHash = raw?.content_hash;
             const decisionId = contentHash ?? raw?.run_id ?? intentHash;
             const idempotencyKey = `${intentHash}:${decisionId}`;
@@ -934,6 +1183,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
               expiresAt: Date.now() + cfg.approvalReplayWindowMs,
             });
 
+            activeRuns.delete(key);
+            await finalizeBlock(raw?.run_id, "blocked_until_approved", `Plugin enforced: approval_required — ${decision.reason ?? event.toolName}`);
+
             return {
               block: true,
               blockReason:
@@ -943,6 +1195,10 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             };
           }
 
+          // deny
+          if (observeOnly) { observeAllow("api", decision); return; }
+          activeRuns.delete(key);
+          await finalizeBlock(raw?.run_id, "blocked", `Plugin enforced: deny — ${decision.reason ?? event.toolName}`);
           return {
             block: true,
             blockReason: decision.reason || `Denied by VAIBot API for tool: ${event.toolName}`,
@@ -959,22 +1215,25 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             api.logger.error?.(`vaibot-circuitbreaker: ${msg}`);
           }
 
-          if (cfg.failClosedOnError || breaker.isTripped()) {
+          if ((cfg.failClosedOnError || breaker.isTripped()) && !observeOnly) {
             return { block: true, blockReason: msg };
           }
         }
       }
     }
 
-    // Bug #5 fix: only clean up replay record on successful allow (not on block)
-    // If we reach here, the chain was exhausted without a clear allow — don't
-    // delete the replay record so it can be retried.
+    // Chain exhausted without a clear allow. In observe, always pass through.
+    if (observeOnly) {
+      api.logger.info?.(`vaibot-circuitbreaker [observe]: chain exhausted for ${event.toolName} — passing through`);
+      if (replayOf) replayByIntentHash.delete(intentHash);
+      return;
+    }
 
     if (cfg.failClosedOnError) {
       return { block: true, blockReason: "VAIBot decision chain exhausted" };
     }
 
-    // If we fall through without failClosedOnError, allow and clean up replay
+    // Fallthrough without failClosedOnError: allow and clean up replay.
     if (replayOf) {
       replayByIntentHash.delete(intentHash);
     }
@@ -1091,14 +1350,26 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     api.on("after_tool_call", onAfterToolCall);
     registerCommands();
 
-    checkGuardHealth()
-      .then((ok) => {
-        if (ok) api.logger.info?.("vaibot-circuitbreaker: guard skill detected (health ok)");
-        else api.logger.warn?.("vaibot-circuitbreaker: guard skill missing or unhealthy");
-      })
-      .catch(() => {
-        api.logger.warn?.("vaibot-circuitbreaker: guard skill missing or unhealthy");
-      });
+    // Kick off auto-bootstrap asynchronously. onBeforeToolCall awaits this
+    // promise before running the decision chain; if it fails, we fall back
+    // to the usual missing-key behavior.
+    if (cfg.autoBootstrap && !getApiKey()) {
+      bootstrapPromise = bootstrap().finally(() => { bootstrapPromise = null; });
+    }
+
+    // Only probe guard health at startup if guard is actually in the chain;
+    // otherwise users running api/mcp-only setups pay for an unused localhost
+    // probe on every plugin load.
+    if (cfg.decisionChain.includes("guard")) {
+      checkGuardHealth()
+        .then((ok) => {
+          if (ok) api.logger.info?.("vaibot-circuitbreaker: guard skill detected (health ok)");
+          else api.logger.warn?.("vaibot-circuitbreaker: guard skill missing or unhealthy");
+        })
+        .catch(() => {
+          api.logger.warn?.("vaibot-circuitbreaker: guard skill missing or unhealthy");
+        });
+    }
 
     if (cfg.approvalAutoRetry) {
       setInterval(() => {
@@ -1113,7 +1384,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     }
 
     api.logger.info?.(
-      `vaibot-circuitbreaker loaded (mode=${cfg.mode}, guard=${cfg.guardBaseUrl}, mcp=${cfg.mcpBaseUrl}, api=${cfg.apiBaseUrl})`,
+      `vaibot-circuitbreaker loaded (mode=${cfg.mode}, agent=${cfg.agent}, ` +
+        `guard=${cfg.guardBaseUrl}, mcp=${cfg.mcpBaseUrl}, api=${cfg.apiBaseUrl}, ` +
+        `autoBootstrap=${cfg.autoBootstrap})`,
     );
   }
 

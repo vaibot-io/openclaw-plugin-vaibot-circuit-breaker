@@ -33,6 +33,25 @@
         "default": "VAIBOT_API_KEY",
         "description": "Env var that contains the VAIBOT API key (fallback decision source)."
       },
+      "dashboardUrl": {
+        "type": "string",
+        "default": "https://www.vaibot.io",
+        "description": "VAIBot dashboard base URL. Used to build claim links on auto-bootstrap and claim-nudge messages."
+      },
+      "autoBootstrap": {
+        "type": "boolean",
+        "default": true,
+        "description": "On first run without an API key, auto-provision a free-tier account via POST /v2/bootstrap and save credentials to credsDir/credentials.json."
+      },
+      "credsDir": {
+        "type": "string",
+        "description": "Directory for credentials.json (shared with other VAIBot plugins). Defaults to $HOME/.vaibot, or $VAIBOT_CREDS_DIR if set."
+      },
+      "agent": {
+        "type": "string",
+        "default": "openclaw",
+        "description": "Agent identifier sent on bootstrap and recorded on decide receipts."
+      },
       "timeoutMs": { "type": "integer", "minimum": 100, "default": 15000 },
       "failClosedOnError": { "type": "boolean", "default": true },
       "sendToolParams": { "type": "boolean", "default": true },
