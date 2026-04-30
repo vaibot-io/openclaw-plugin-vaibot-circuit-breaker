@@ -71,9 +71,11 @@ While tripped, tools are classified into three groups:
 
 | Classification | Default tools | Behaviour |
 |---|---|---|
-| Allowlist | `read`, `web_fetch` | Pass through automatically |
-| Denylist | `exec`, `write`, `sessions_send`, `message.send` | Hard blocked |
-| Unknown | everything else | Held for your approval |
+| Allowlist | `read`, `web_fetch` | Pass through automatically — low risk |
+| Gate | everything else | Held for your approval — dangerous actions are gated, not killed |
+| Denylist | _(empty)_ | Hard blocked — operator-configured for tools that must never run |
+
+The key design principle: VAIBot gates dangerous actions, it doesn't freeze the agent. `exec`, `write`, `sessions_send`, and `message.send` all require human approval during a breaker trip, but the agent can continue once you approve. The denylist exists as an escape hatch for operators who need to categorically prohibit specific tools in their deployment — it is empty by default.
 
 For unknown tools, the agent receives:
 ```
@@ -140,8 +142,8 @@ All settings are optional. Override in `~/.openclaw/openclaw.json`:
 | `mcpBaseUrl` | `https://api.vaibot.io/v2/mcp` | VAIBot MCP endpoint |
 | `apiBaseUrl` | `https://api.vaibot.io` | VAIBot API endpoint |
 | `autoBootstrap` | `true` | Provision a free account on first run if no key found |
-| `breakerAllowlist` | `["read","web_fetch"]` | Pass-through tools when breaker trips |
-| `breakerDenylist` | `["exec","write","sessions_send","message.send"]` | Hard-blocked tools when breaker trips |
+| `breakerAllowlist` | `["read","web_fetch"]` | Auto-approved tools when breaker trips |
+| `breakerDenylist` | `[]` | Hard-blocked tools when breaker trips — empty by default; all other tools are gated for human approval |
 | `breakerFailureThreshold` | `3` | Failures before breaker trips |
 | `breakerWindowMs` | `10000` | Failure counting window (ms) |
 | `breakerCooldownMs` | `60000` | Time before breaker auto-clears (ms) |

@@ -62,7 +62,7 @@
       "breakerWindowMs": { "type": "integer", "minimum": 1000, "default": 10000 },
       "breakerCooldownMs": { "type": "integer", "minimum": 1000, "default": 60000 },
       "breakerAllowlist": { "type": "array", "items": { "type": "string" }, "default": ["read", "web_fetch"] },
-      "breakerDenylist": { "type": "array", "items": { "type": "string" }, "default": ["exec", "write", "sessions_send", "message.send"] },
+      "breakerDenylist": { "type": "array", "items": { "type": "string" }, "default": [] },
       "approvalAutoRetry": { "type": "boolean", "default": true },
       "approvalPollMs": { "type": "integer", "minimum": 1000, "default": 15000 },
       "approvalReplayWindowMs": { "type": "integer", "minimum": 60000, "default": 1800000 },

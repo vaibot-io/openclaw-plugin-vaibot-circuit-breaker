@@ -346,7 +346,7 @@ function resolveConfig(api: OpenClawPluginApi): Required<PluginConfig> {
     breakerWindowMs: Number.isFinite(cfg.breakerWindowMs) ? Number(cfg.breakerWindowMs) : 10000,
     breakerCooldownMs: Number.isFinite(cfg.breakerCooldownMs) ? Number(cfg.breakerCooldownMs) : 60000,
     breakerAllowlist: Array.isArray(cfg.breakerAllowlist) ? cfg.breakerAllowlist : ["read", "web_fetch"],
-    breakerDenylist: Array.isArray(cfg.breakerDenylist) ? cfg.breakerDenylist : ["exec", "write", "sessions_send", "message.send"],
+    breakerDenylist: Array.isArray(cfg.breakerDenylist) ? cfg.breakerDenylist : [],
     breakerTelemetryAllowlist: Array.isArray(cfg.breakerTelemetryAllowlist) ? cfg.breakerTelemetryAllowlist : [],
     breakerProbeIntervalMs: Number.isFinite(cfg.breakerProbeIntervalMs) ? Number(cfg.breakerProbeIntervalMs) : 15000,
     approvalAutoRetry: cfg.approvalAutoRetry !== false,
