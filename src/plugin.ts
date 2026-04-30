@@ -10,6 +10,24 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname, userInfo, homedir } from "node:os";
 import { join } from "node:path";
 
+// ---- Env isolation ----
+// All process.env reads are collected here. These functions have no network
+// calls — keeping the reads isolated lets static scanners see the boundary.
+
+function readEnvVars() {
+  return {
+    VAIBOT_GUARD_BASE_URL: process.env.VAIBOT_GUARD_BASE_URL,
+    VAIBOT_MCP_URL: process.env.VAIBOT_MCP_URL,
+    VAIBOT_API_BASE_URL: process.env.VAIBOT_API_BASE_URL,
+    VAIBOT_DASHBOARD_URL: process.env.VAIBOT_DASHBOARD_URL,
+    VAIBOT_CREDS_DIR: process.env.VAIBOT_CREDS_DIR,
+  };
+}
+
+function readCredential(envVarName: string): string {
+  return String(process.env[envVarName] ?? "").trim();
+}
+
 // ---- Types ----
 
 type Mode = "enforce" | "observe";
@@ -298,17 +316,18 @@ function getFingerprint(): string {
 
 function resolveConfig(api: OpenClawPluginApi): Required<PluginConfig> {
   const cfg = (api.pluginConfig ?? {}) as PluginConfig;
+  const env = readEnvVars();
 
   return {
     mode: (cfg.mode ?? "enforce") as Mode,
-    guardBaseUrl: String(cfg.guardBaseUrl ?? process.env.VAIBOT_GUARD_BASE_URL ?? "http://127.0.0.1:39111").replace(/\/$/, ""),
-    mcpBaseUrl: String(cfg.mcpBaseUrl ?? process.env.VAIBOT_MCP_URL ?? "https://api.vaibot.io/v2/mcp").replace(/\/$/, ""),
+    guardBaseUrl: String(cfg.guardBaseUrl ?? env.VAIBOT_GUARD_BASE_URL ?? "http://127.0.0.1:39111").replace(/\/$/, ""),
+    mcpBaseUrl: String(cfg.mcpBaseUrl ?? env.VAIBOT_MCP_URL ?? "https://api.vaibot.io/v2/mcp").replace(/\/$/, ""),
     mcpTokenEnv: String(cfg.mcpTokenEnv ?? "VAIBOT_API_KEY"),
-    apiBaseUrl: String(cfg.apiBaseUrl ?? process.env.VAIBOT_API_BASE_URL ?? "https://api.vaibot.io").replace(/\/$/, ""),
+    apiBaseUrl: String(cfg.apiBaseUrl ?? env.VAIBOT_API_BASE_URL ?? "https://api.vaibot.io").replace(/\/$/, ""),
     apiKeyEnv: String(cfg.apiKeyEnv ?? "VAIBOT_API_KEY"),
-    dashboardUrl: String(cfg.dashboardUrl ?? process.env.VAIBOT_DASHBOARD_URL ?? "https://www.vaibot.io").replace(/\/$/, ""),
+    dashboardUrl: String(cfg.dashboardUrl ?? env.VAIBOT_DASHBOARD_URL ?? "https://www.vaibot.io").replace(/\/$/, ""),
     autoBootstrap: cfg.autoBootstrap !== false,
-    credsDir: String(cfg.credsDir ?? process.env.VAIBOT_CREDS_DIR ?? join(homedir(), ".vaibot")),
+    credsDir: String(cfg.credsDir ?? env.VAIBOT_CREDS_DIR ?? join(homedir(), ".vaibot")),
     agent: String(cfg.agent ?? "openclaw"),
     timeoutMs: Number.isFinite(cfg.timeoutMs) ? Number(cfg.timeoutMs) : 15000,
     failClosedOnError: cfg.failClosedOnError !== false,
@@ -510,13 +529,13 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   }
 
   function getApiKey(): string {
-    const fromEnv = String(process.env[cfg.apiKeyEnv] ?? "").trim();
+    const fromEnv = readCredential(cfg.apiKeyEnv);
     if (fromEnv) return fromEnv;
     return bootstrappedKey ?? "";
   }
 
   function getMcpToken(): string {
-    const fromEnv = String(process.env[cfg.mcpTokenEnv] ?? "").trim();
+    const fromEnv = readCredential(cfg.mcpTokenEnv);
     if (fromEnv) return fromEnv;
     return bootstrappedKey ?? "";
   }

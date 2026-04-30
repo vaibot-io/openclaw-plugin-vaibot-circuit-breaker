@@ -13,6 +13,21 @@ openclaw gateway restart
 
 That's it. The plugin loads with sensible defaults — no config required.
 
+## Local Dev / Tarball Install Notes
+
+When installing from a local path or freshly packed tarball, OpenClaw may block installation unless you explicitly acknowledge the plugin's runtime shape. This plugin legitimately reads environment variables (for local guard/API auth) and makes network calls (guard/MCP/API decision chain), which can trip the built-in unsafe-pattern scanner.
+
+Example local install:
+
+```bash
+openclaw plugins install --dangerously-force-unsafe-install ./vaibot-circuit-breaker-openclaw-plugin-0.2.1.tgz
+openclaw gateway restart
+```
+
+Notes:
+- The publish bundle is intended to ship runtime files only; test files should not be included in the tarball.
+- `--dangerously-force-unsafe-install` should be treated as a deliberate local-dev/operator action, not the default happy path for end users.
+
 To verify:
 
 ```bash

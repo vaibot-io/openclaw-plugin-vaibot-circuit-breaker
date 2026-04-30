@@ -1,6 +1,6 @@
 {
   "name": "@vaibot/circuit-breaker-openclaw-plugin",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "license": "MIT",
   "description": "OpenClaw plugin that enforces VAIBot governance decisions with a multi-source decision chain and circuit-breaker fallback.",
   "type": "module",
@@ -11,7 +11,8 @@
     "README.md",
     "LICENSE",
     "scripts/**",
-    "src/**",
+    "src/plugin.ts",
+    "src/openclaw-plugin-sdk.d.ts",
     "systemd/**",
     "references/**",
     "assets/**"
@@ -21,6 +22,7 @@
   },
   "scripts": {
     "test": "vitest run",
+    "test:pack": "node ./scripts/verify-pack.mjs",
     "postinstall": "node ./scripts/postinstall.mjs"
   },
   "devDependencies": {

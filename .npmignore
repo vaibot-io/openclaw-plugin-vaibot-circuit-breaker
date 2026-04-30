@@ -1,3 +1,6 @@
-# Exclude tests from publish bundles
-**/*.test.ts
+src/**/*.test.ts
+src/**/*.test.js
+src/**/*.spec.ts
+src/**/*.spec.js
 vitest.config.ts
+*.tgz
