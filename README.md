@@ -4,6 +4,23 @@ OpenClaw Gateway plugin that enforces VAIBot governance decisions on every tool 
 
 VAIBot classifies each tool call against your governance policy and returns an allow, deny, or approval-required decision before the tool executes. Every decision creates a tamper-evident receipt with on-chain provenance anchoring.
 
+## Plugin vs. MCP server
+
+VAIBot also ships an MCP server that exposes governance tools Claude can call voluntarily. The plugin and the MCP server are complementary — they serve different roles:
+
+| | MCP server | This plugin |
+|---|---|---|
+| Agent queries policy / status | ✓ | ✗ |
+| Agent approves actions in-session | ✓ | ✓ |
+| Enforcement happens before execution | ✗ | ✓ |
+| Agent can skip or bypass the check | ✓ | ✗ |
+| Audit trail the agent can't forge | ✗ | ✓ |
+| Circuit breaker when API is unreachable | ✗ | ✓ |
+
+The MCP server gives the agent a way to query and interact with VAIBot. The plugin is what makes governance **mandatory** — the check happens at the gateway level before the tool executes, regardless of what the agent does. If the goal is a tamper-evident audit record or blocking a misbehaving agent, the plugin is the enforcement layer that actually enforces it.
+
+Most deployments use both: the plugin for mandatory pre-execution enforcement, the MCP server so the agent can surface policy context and manage approvals in-session.
+
 ## Install
 
 ```bash
