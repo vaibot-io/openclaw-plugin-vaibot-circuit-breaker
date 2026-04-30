@@ -171,6 +171,18 @@ Set in `~/.openclaw/.env` or your service environment:
 { "config": { "mode": "observe" } }
 ```
 
+## Community & support
+
+**[Join the VAIBot Discord](https://discord.gg/mSHYtP5nV)** — get help, share feedback, and connect with other users.
+
+VAIBot is in early access. If you're installing this plugin now, you're among the first operators putting verifiable AI governance into production. Early community members shape the roadmap directly — feature requests, policy design, and integration patterns all come from conversations in Discord.
+
+To become a founding member, join the Discord and introduce yourself in **#founding-members**. Founding members get:
+- Direct access to the VAIBot team
+- Early previews of upcoming governance features
+- Input on default policy design and circuit breaker defaults
+- Recognition in the project
+
 ## Uninstall
 
 ```bash
