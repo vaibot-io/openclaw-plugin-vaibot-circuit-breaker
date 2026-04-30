@@ -21,6 +21,7 @@ function readEnvVars() {
     VAIBOT_API_BASE_URL: process.env.VAIBOT_API_BASE_URL,
     VAIBOT_DASHBOARD_URL: process.env.VAIBOT_DASHBOARD_URL,
     VAIBOT_CREDS_DIR: process.env.VAIBOT_CREDS_DIR,
+    VAIBOT_GUARD_TOKEN: process.env.VAIBOT_GUARD_TOKEN,
   };
 }
 
@@ -39,6 +40,7 @@ type PluginConfig = {
   guardBaseUrl?: string;
   mcpBaseUrl?: string;
   mcpTokenEnv?: string;
+  guardTokenEnv?: string;
   apiBaseUrl?: string;
   apiKeyEnv?: string;
   dashboardUrl?: string;
@@ -323,6 +325,7 @@ function resolveConfig(api: OpenClawPluginApi): Required<PluginConfig> {
     guardBaseUrl: String(cfg.guardBaseUrl ?? env.VAIBOT_GUARD_BASE_URL ?? "http://127.0.0.1:39111").replace(/\/$/, ""),
     mcpBaseUrl: String(cfg.mcpBaseUrl ?? env.VAIBOT_MCP_URL ?? "https://api.vaibot.io/v2/mcp").replace(/\/$/, ""),
     mcpTokenEnv: String(cfg.mcpTokenEnv ?? "VAIBOT_API_KEY"),
+    guardTokenEnv: String(cfg.guardTokenEnv ?? "VAIBOT_GUARD_TOKEN"),
     apiBaseUrl: String(cfg.apiBaseUrl ?? env.VAIBOT_API_BASE_URL ?? "https://api.vaibot.io").replace(/\/$/, ""),
     apiKeyEnv: String(cfg.apiKeyEnv ?? "VAIBOT_API_KEY"),
     dashboardUrl: String(cfg.dashboardUrl ?? env.VAIBOT_DASHBOARD_URL ?? "https://www.vaibot.io").replace(/\/$/, ""),
@@ -418,7 +421,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   const replayByIntentHash = new Map<string, { contentHash: string; expiresAt: number }>();
 
   const stateDir = api.runtime.state.resolveStateDir();
-  const statePath = `${stateDir}/vaibot-circuit-breaker-v2.json`;
+  const statePath = `${stateDir}/circuit-breaker-openclaw-plugin.json`;
   let lastTripLogged = false;
 
   // Auto-bootstrap state. Seed from saved credentials so restarts reuse the same account.
@@ -475,7 +478,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   }
 
   function getGuardAuthHeaders(): Record<string, string> {
-    const token = String(process.env.VAIBOT_GUARD_TOKEN ?? "").trim();
+    const token = readCredential(cfg.guardTokenEnv);
     if (!token) return {};
     return { authorization: `Bearer ${token}` };
   }
@@ -604,7 +607,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     if (nudgedSessions.has(sessionId)) return;
     // Only nudge when running on a bootstrapped key — env-provided keys are
     // the user's own and already associated with a claimed account.
-    const envKey = String(process.env[cfg.apiKeyEnv] ?? "").trim();
+    const envKey = readCredential(cfg.apiKeyEnv);
     if (envKey) return;
     const apiKey = bootstrappedKey;
     if (!apiKey) return;
@@ -913,16 +916,45 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
 
   async function probeUpstreams() {
     if (!breaker.isTripped()) return;
-    try {
-      const ok = await checkGuardHealth();
-      if (ok) {
-        breaker.recordSuccess();
-        persistBreakerState();
-        api.logger.info?.("vaibot-circuitbreaker: breaker CLEARED (probe)");
-        lastTripLogged = false;
+
+    // Only probe sources that are actually in the configured chain.
+    const chain = cfg.decisionChain.filter((s) => s !== "breaker");
+
+    for (const source of chain) {
+      try {
+        if (source === "guard") {
+          const ok = await checkGuardHealth();
+          if (ok) {
+            breaker.recordSuccess();
+            persistBreakerState();
+            api.logger.info?.("vaibot-circuitbreaker: breaker CLEARED (probe:guard)");
+            lastTripLogged = false;
+            return;
+          }
+        } else if (source === "api") {
+          const apiKey = getApiKey();
+          if (apiKey) {
+            await getJson<any>(`${cfg.apiBaseUrl}/v2/health`, cfg.timeoutMs, { authorization: `Bearer ${apiKey}` });
+            breaker.recordSuccess();
+            persistBreakerState();
+            api.logger.info?.("vaibot-circuitbreaker: breaker CLEARED (probe:api)");
+            lastTripLogged = false;
+            return;
+          }
+        } else if (source === "mcp") {
+          const token = getMcpToken();
+          if (token) {
+            await getJson<any>(`${cfg.apiBaseUrl}/v2/health`, cfg.timeoutMs, { authorization: `Bearer ${token}` });
+            breaker.recordSuccess();
+            persistBreakerState();
+            api.logger.info?.("vaibot-circuitbreaker: breaker CLEARED (probe:mcp)");
+            lastTripLogged = false;
+            return;
+          }
+        }
+      } catch {
+        // source still unhealthy — try the next one
       }
-    } catch {
-      // ignore probe errors
     }
   }
 
@@ -972,7 +1004,12 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
         return;
       }
       if (observeOnly) {
-        api.logger.info?.(`vaibot-circuitbreaker [observe]: breaker tripped — would block ${event.toolName}`);
+        const verdict = breaker.canAllow(event.toolName) ? "would allow (allowlist)" : "would block";
+        api.logger.info?.(`vaibot-circuitbreaker [observe]: breaker tripped — ${verdict} ${event.toolName}`);
+        return;
+      }
+      if (breaker.canAllow(event.toolName)) {
+        api.logger.info?.(`vaibot-circuitbreaker: breaker tripped — allowlist pass-through for ${event.toolName}`);
         return;
       }
       return {

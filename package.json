@@ -1,6 +1,6 @@
 {
   "name": "@vaibot/circuit-breaker-openclaw-plugin",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "license": "MIT",
   "description": "OpenClaw plugin that enforces VAIBot governance decisions with a multi-source decision chain and circuit-breaker fallback.",
   "type": "module",
