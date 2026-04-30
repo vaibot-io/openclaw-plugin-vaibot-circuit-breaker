@@ -2,7 +2,7 @@
   "id": "circuit-breaker-openclaw-plugin",
   "name": "VAIBot Circuit Breaker v2",
   "description": "OpenClaw Gateway plugin that enforces VAIBot governance decisions with a circuit-breaker fallback.",
-  "version": "0.2.4",
+  "version": "0.2.2",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
