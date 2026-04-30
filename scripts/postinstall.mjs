@@ -4,7 +4,7 @@ import path from 'node:path'
 import os from 'node:os'
 
 const PKG_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
-const PLUGIN_ID = 'vaibot-circuit-breaker-v2'
+const PLUGIN_ID = 'circuit-breaker-openclaw-plugin'
 const DEFAULT_STATE_DIR = path.join(os.homedir(), '.openclaw')
 
 // ---- Skip if OpenClaw's native installer already handled placement ----

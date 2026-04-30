@@ -31,7 +31,7 @@ Notes:
 To verify:
 
 ```bash
-openclaw plugins inspect vaibot-circuit-breaker-v2
+openclaw plugins inspect circuit-breaker-openclaw-plugin
 ```
 
 ## Optional: Set API Key
@@ -60,13 +60,13 @@ The postinstall script copies the plugin into OpenClaw's extensions directory an
 
 All config is optional. Defaults are production-ready.
 
-Add overrides in `~/.openclaw/openclaw.json` under `plugins.entries.vaibot-circuit-breaker-v2.config`:
+Add overrides in `~/.openclaw/openclaw.json` under `plugins.entries.circuit-breaker-openclaw-plugin.config`:
 
 ```json
 {
   "plugins": {
     "entries": {
-      "vaibot-circuit-breaker-v2": {
+      "circuit-breaker-openclaw-plugin": {
         "enabled": true,
         "config": {
           "mode": "enforce",
@@ -104,7 +104,7 @@ Set these in `~/.openclaw/.env` or your service environment.
 
 ## Upgrade from v1
 
-1. The plugin ID changed to `vaibot-circuit-breaker-v2`
+1. The plugin ID changed to `circuit-breaker-openclaw-plugin`
 2. Set `VAIBOT_API_KEY` (used for MCP + API fallbacks)
 3. Optionally customize `decisionChain` to skip sources you don't use
 
@@ -118,6 +118,6 @@ Set these in `~/.openclaw/.env` or your service environment.
 ## Uninstall
 
 ```bash
-openclaw plugins uninstall vaibot-circuit-breaker-v2
+openclaw plugins uninstall circuit-breaker-openclaw-plugin
 openclaw gateway restart
 ```
