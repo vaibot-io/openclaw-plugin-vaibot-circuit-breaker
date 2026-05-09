@@ -310,10 +310,16 @@ function saveCredentials(credsDir: string, creds: SavedCredentials): void {
  * whichever plugin bootstraps first. Server uses this for bootstrap idempotency.
  */
 function getFingerprint(): string {
+  // Identifier for bootstrap idempotency. NOT cwd-dependent — running
+  // OpenClaw from any working directory on the same user@host yields the
+  // same fingerprint, so each operator gets exactly ONE bootstrap account
+  // per machine instead of one-per-cwd. For cross-machine identity
+  // continuity, propagate the cached api_key (~/.vaibot/credentials.json)
+  // via the VAIBOT_API_KEY env var rather than trying to share a
+  // fingerprint.
   const user = userInfo().username;
   const host = hostname();
-  const cwd = process.cwd();
-  return createHash("sha256").update(`${user}@${host}:${cwd}`).digest("hex");
+  return createHash("sha256").update(`${user}@${host}`).digest("hex");
 }
 
 function resolveConfig(api: OpenClawPluginApi): Required<PluginConfig> {
