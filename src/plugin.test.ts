@@ -222,13 +222,6 @@ describe('CircuitBreaker class', () => {
     vi.useRealTimers()
   })
 
-  it('canAllow uses allow/deny lists', () => {
-    const breaker = new CircuitBreaker(cfg as any)
-    expect(breaker.canAllow('read')).toBe(true)
-    expect(breaker.canAllow('exec')).toBe(false)
-    expect(breaker.canAllow('other')).toBe(false)
-  })
-
   it('recordSuccess clears failures and trip', () => {
     const breaker = new CircuitBreaker(cfg as any)
     breaker.recordFailure()
@@ -679,7 +672,7 @@ describe('createCircuitBreaker integration', () => {
 
   // ---- Breaker fail-closed (Bug #2) ----
 
-  it('blocks all tools when breaker is tripped (fail-closed)', async () => {
+  it('when tripped, classifier-safe tools pass but ambiguous tools are held (fail-closed)', async () => {
     process.env.VAIBOT_API_KEY = 'test-token'
     const api = makeApi({ breakerFailureThreshold: 1 })
     const { createCircuitBreaker } = await import('./plugin.js')
@@ -690,45 +683,25 @@ describe('createCircuitBreaker integration', () => {
     globalThis.fetch = fetchMock as any
 
     const handler = (api as any).__handlers['before_tool_call']
-    // First call trips breaker via chain failures
-    await handler(baseEvent, baseCtx)
+    await handler(baseEvent, baseCtx) // first call trips breaker via chain failures
 
-    // Reset mock — subsequent call should be blocked by breaker without any fetch
+    // Reset mock — the tripped path decides LOCALLY via the classifier (no fetch).
     const fetchMock2 = vi.fn()
     globalThis.fetch = fetchMock2 as any
 
-    const res = await handler({ ...baseEvent, toolCallId: 't2' }, baseCtx)
-    expect(res).toEqual({
+    // classifier-safe tool (read) passes through.
+    const safe = await handler({ toolName: 'read', params: { file_path: 'x.ts' }, runId: 'r2', toolCallId: 't2' }, baseCtx)
+    expect(safe).toBeUndefined()
+
+    // ambiguous/unknown tool is held for approval (fail-closed).
+    const held = await handler({ toolName: 'frobnicate_widget', params: {}, runId: 'r3', toolCallId: 't3' }, baseCtx)
+    expect(held).toEqual({
       block: true,
       blockReason: expect.stringContaining('Circuit breaker active'),
     })
-    // No fetches — breaker blocks before any upstream call
+
+    // No upstream fetches — the tripped breaker decides locally.
     expect(fetchMock2).not.toHaveBeenCalled()
-  })
-
-  it('telemetry-allowlisted tools pass through even when breaker is tripped', async () => {
-    process.env.VAIBOT_API_KEY = 'test-token'
-    const api = makeApi({ breakerFailureThreshold: 1, breakerTelemetryAllowlist: ['telemetry_log'] })
-    const { createCircuitBreaker } = await import('./plugin.js')
-    createCircuitBreaker(api as any).register()
-
-    // Trip the breaker
-    const fetchMock = vi.fn().mockRejectedValue(new Error('network down'))
-    globalThis.fetch = fetchMock as any
-
-    const handler = (api as any).__handlers['before_tool_call']
-    await handler(baseEvent, baseCtx) // trips breaker
-
-    const fetchMock2 = vi.fn()
-    globalThis.fetch = fetchMock2 as any
-
-    // telemetry_log should pass
-    const res = await handler({ toolName: 'telemetry_log', params: {}, runId: 'r2', toolCallId: 't3' }, baseCtx)
-    expect(res).toBeUndefined()
-
-    // non-telemetry tool should still block
-    const res2 = await handler({ toolName: 'write', params: {}, runId: 'r3', toolCallId: 't4' }, baseCtx)
-    expect(res2?.block).toBe(true)
   })
 
   // ---- Guard approval flow (Bug #4, #15) ----
@@ -1291,11 +1264,14 @@ describe('auto-bootstrap and claim nudge', () => {
     const credsPath = path.join(testCredsDir, 'credentials.json')
     expect(fs.existsSync(credsPath)).toBe(true)
     const saved = JSON.parse(fs.readFileSync(credsPath, 'utf-8'))
-    expect(saved.api_key).toBe('boot_k2')
-    expect(saved.account_id).toBe('acct_2')
-    expect(saved.wallet_address).toBe('0xdef')
-    expect(saved.api_url).toBe('https://api.vaibot.io')
-    expect(typeof saved.bootstrapped_at).toBe('string')
+    // v2 env-namespaced slim store: prod (default apiBaseUrl) slot holds only
+    // api_key + wallet_address; account_id/user_id/api_url/etc. are not stored.
+    expect(saved.version).toBe(2)
+    expect(saved.active_env).toBe('production')
+    expect(saved.environments.production.api_key).toBe('boot_k2')
+    expect(saved.environments.production.wallet_address).toBe('0xdef')
+    expect(saved.environments.production.account_id).toBeUndefined()
+    expect(saved.environments.production.api_url).toBeUndefined()
   })
 
   it('uses bootstrapped api_key for subsequent decide calls', async () => {

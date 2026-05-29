@@ -6,9 +6,16 @@ import type {
   PluginHookBeforeToolCallResult,
 } from "openclaw/plugin-sdk";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname, userInfo, homedir } from "node:os";
 import { join } from "node:path";
+import {
+  loadCredsForEnv,
+  saveCredsForEnv,
+  migrateFileIfNeeded,
+  envForApiUrl,
+  DEFAULT_ENV,
+} from "./creds.mjs";
+import { classify } from "./classifier.mjs";
 
 // ---- Env isolation ----
 // All process.env reads are collected here. These functions have no network
@@ -60,24 +67,13 @@ type PluginConfig = {
   breakerFailureThreshold?: number;
   breakerWindowMs?: number;
   breakerCooldownMs?: number;
-  breakerAllowlist?: string[];
   breakerDenylist?: string[];
-  breakerTelemetryAllowlist?: string[];
   breakerProbeIntervalMs?: number;
   approvalAutoRetry?: boolean;
   approvalPollMs?: number;
   approvalReplayWindowMs?: number;
 };
 
-type SavedCredentials = {
-  api_key?: string;
-  account_id?: string;
-  user_id?: string;
-  wallet_address?: string;
-  wallet_network?: string;
-  api_url?: string;
-  bootstrapped_at?: string;
-};
 
 type BootstrapResponse = {
   api_key?: string;
@@ -287,22 +283,10 @@ function toSessionId(ctx: PluginHookAgentContext): string {
   return String(ctx.sessionId || ctx.sessionKey || "unknown-session");
 }
 
-// ---- Credentials (shared with Claude Code plugin at ~/.vaibot/credentials.json) ----
-
-function loadSavedCredentials(credsDir: string): SavedCredentials | null {
-  try {
-    const file = join(credsDir, "credentials.json");
-    if (existsSync(file)) return JSON.parse(readFileSync(file, "utf-8")) as SavedCredentials;
-  } catch { /* corrupt / unreadable — ignore */ }
-  return null;
-}
-
-function saveCredentials(credsDir: string, creds: SavedCredentials): void {
-  try {
-    mkdirSync(credsDir, { recursive: true, mode: 0o700 });
-    writeFileSync(join(credsDir, "credentials.json"), JSON.stringify(creds, null, 2), { mode: 0o600 });
-  } catch { /* best-effort */ }
-}
+// ---- Credentials ----
+// Shared env-namespaced store (~/.vaibot/credentials.json) via @vaibot/shared.
+// Reads/writes are scoped to the env derived from cfg.apiBaseUrl, so a staging
+// bootstrap never clobbers the production slot and vice versa.
 
 /**
  * Forensic correlation fingerprint — NOT machine attestation. Matches the Claude
@@ -351,9 +335,7 @@ function resolveConfig(api: OpenClawPluginApi): Required<PluginConfig> {
     breakerFailureThreshold: Number.isFinite(cfg.breakerFailureThreshold) ? Number(cfg.breakerFailureThreshold) : 3,
     breakerWindowMs: Number.isFinite(cfg.breakerWindowMs) ? Number(cfg.breakerWindowMs) : 10000,
     breakerCooldownMs: Number.isFinite(cfg.breakerCooldownMs) ? Number(cfg.breakerCooldownMs) : 60000,
-    breakerAllowlist: Array.isArray(cfg.breakerAllowlist) ? cfg.breakerAllowlist : ["read", "web_fetch"],
     breakerDenylist: Array.isArray(cfg.breakerDenylist) ? cfg.breakerDenylist : [],
-    breakerTelemetryAllowlist: Array.isArray(cfg.breakerTelemetryAllowlist) ? cfg.breakerTelemetryAllowlist : [],
     breakerProbeIntervalMs: Number.isFinite(cfg.breakerProbeIntervalMs) ? Number(cfg.breakerProbeIntervalMs) : 15000,
     approvalAutoRetry: cfg.approvalAutoRetry !== false,
     approvalPollMs: Number.isFinite(cfg.approvalPollMs) ? Number(cfg.approvalPollMs) : 15000,
@@ -408,12 +390,6 @@ export class CircuitBreaker {
     }
     return true;
   }
-
-  canAllow(toolName: string): boolean {
-    if (this.cfg.breakerDenylist.includes(toolName)) return false;
-    if (this.cfg.breakerAllowlist.includes(toolName)) return true;
-    return false;
-  }
 }
 
 // ---- Plugin ----
@@ -431,16 +407,19 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   const statePath = `${stateDir}/circuit-breaker-openclaw-plugin.json`;
   let lastTripLogged = false;
 
-  // Auto-bootstrap state. Seed from saved credentials so restarts reuse the same account.
-  const initialCreds = loadSavedCredentials(cfg.credsDir);
+  // Auto-bootstrap state. Seed from saved credentials so restarts reuse the same
+  // account. The env (production/staging) is derived from the configured API base
+  // URL so reads/writes hit the matching credential slot.
+  migrateFileIfNeeded({ dir: cfg.credsDir });
+  const credsEnv = envForApiUrl(cfg.apiBaseUrl) ?? DEFAULT_ENV;
+  const initialCreds = loadCredsForEnv(credsEnv, { dir: cfg.credsDir });
   let bootstrappedKey: string | null = initialCreds?.api_key ? String(initialCreds.api_key) : null;
   let bootstrapPromise: Promise<void> | null = null;
   const nudgedSessions = new Set<string>();
-  const runtimeAllowlist: string[] = []; // tools approved by user during breaker trips; persisted across restarts
 
   function persistBreakerState() {
     try {
-      const snap = { ...breaker.snapshot(), runtimeAllowlist };
+      const snap = breaker.snapshot();
       api.runtime.config.writeConfigFile(statePath, snap as any);
     } catch (err) {
       api.logger.warn?.(`vaibot-circuitbreaker: failed to persist breaker state (${String(err)})`);
@@ -451,13 +430,6 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     try {
       const state = api.runtime.config.loadConfig(statePath) as any;
       breaker.load(state ?? undefined);
-      if (Array.isArray(state?.runtimeAllowlist)) {
-        for (const tool of state.runtimeAllowlist) {
-          if (typeof tool === "string" && !runtimeAllowlist.includes(tool)) {
-            runtimeAllowlist.push(tool);
-          }
-        }
-      }
     } catch {
       // ignore
     }
@@ -583,15 +555,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
 
     if (res?.api_key) {
       bootstrappedKey = String(res.api_key);
-      saveCredentials(cfg.credsDir, {
-        api_key: res.api_key,
-        account_id: res.account_id,
-        user_id: res.user_id,
-        wallet_address: res.wallet_address,
-        wallet_network: res.wallet_network,
-        api_url: cfg.apiBaseUrl,
-        bootstrapped_at: new Date().toISOString(),
-      });
+      saveCredsForEnv(credsEnv, { api_key: res.api_key, wallet_address: res.wallet_address }, { dir: cfg.credsDir });
       const claimUrl = `${cfg.dashboardUrl}/claim?api_key=${encodeURIComponent(res.api_key)}`;
       api.logger.info?.(
         `vaibot-circuitbreaker: account provisioned` +
@@ -1013,66 +977,64 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       );
     }
 
-    // Bug #2 fix: when breaker is tripped, default to DENY (fail-closed).
-    // Only telemetry-allowlisted tools pass through. All others are blocked.
-    // In observe mode the breaker is informational — log and allow.
+    // When the breaker is tripped, decide locally (fail-closed): the denylist
+    // blocks, the classifier passes safe tools, and everything else is held for
+    // approval. In observe mode the breaker is informational — log and allow.
     if (breaker.isTripped()) {
       if (!lastTripLogged) {
         api.logger.warn?.(`vaibot-circuitbreaker: breaker is TRIPPED (${observeOnly ? "observe/log-only" : "fail-closed"})`);
         lastTripLogged = true;
       }
 
-      // Telemetry allowlist passes through unconditionally (even in observe mode).
-      if (cfg.breakerTelemetryAllowlist.includes(event.toolName)) {
-        api.logger.info?.(`vaibot-circuitbreaker: breaker telemetry-only allowlist for ${event.toolName}`);
-        return;
-      }
-
-      const isAllowed = cfg.breakerAllowlist.includes(event.toolName) || runtimeAllowlist.includes(event.toolName);
+      // No allowlist. While tripped, the local risk classifier decides: the
+      // denylist (safety floor) blocks; classifier-safe tools pass; everything
+      // else is HELD for human approval via the gateway (OpenClaw's strength).
+      const verdict = classify({ tool: event.toolName, input: event.params ?? {} });
       const isDenied = cfg.breakerDenylist.includes(event.toolName);
 
       if (observeOnly) {
-        const verdict = isAllowed ? "would allow (allowlist)" : isDenied ? "would block (denylist)" : "would hold for approval (unknown)";
-        api.logger.info?.(`vaibot-circuitbreaker [observe]: breaker tripped — ${verdict} ${event.toolName}`);
+        const v = isDenied
+          ? "would block (denylist)"
+          : verdict.verdictHint === "allow"
+            ? "would allow (classifier-safe)"
+            : "would hold for approval";
+        api.logger.info?.(`vaibot-circuitbreaker [observe]: breaker tripped — ${v} ${event.toolName}`);
         return;
       }
 
-      if (isAllowed) {
-        api.logger.info?.(`vaibot-circuitbreaker: breaker tripped — allowlist pass-through for ${event.toolName}`);
+      if (isDenied) {
+        return { block: true, blockReason: `Circuit breaker active — denylisted tool: ${event.toolName}` };
+      }
+
+      if (verdict.verdictHint === "allow") {
+        api.logger.info?.(`vaibot-circuitbreaker: breaker tripped — classifier pass-through (${verdict.risk}) for ${event.toolName}`);
         return;
       }
 
-      if (!isDenied) {
-        // Unknown tool — hold for local human approval rather than hard-blocking.
-        // The approval ID is derived from the intent hash so duplicate calls for the
-        // same tool+params map to the same pending entry rather than stacking.
-        const localApprovalId = `breaker:${intentHash.slice(7, 23)}`;
-        if (!breakerPending.has(localApprovalId)) {
-          breakerPending.set(localApprovalId, {
-            key: localApprovalId,
-            toolName: event.toolName,
-            params: event.params ?? {},
-            sessionKey: ctx.sessionKey,
-            sessionId: ctx.sessionId,
-            agentId: ctx.agentId,
-            channelId: ctx.channelId,
-            intentHash,
-            expiresAt: Date.now() + cfg.approvalReplayWindowMs,
-          });
-        }
-        api.logger.info?.(`vaibot-circuitbreaker: breaker tripped — unknown tool '${event.toolName}' held for approval (${localApprovalId})`);
-        return {
-          block: true,
-          blockReason:
-            `Circuit breaker active — '${event.toolName}' is not on the allowlist or denylist and needs approval.\n` +
-            `Approve: /guard approve ${localApprovalId}\n` +
-            `Deny:    /guard deny ${localApprovalId}`,
-        };
+      // Ambiguous / dangerous — hold for local human approval rather than hard-
+      // blocking. The approval ID is derived from the intent hash so duplicate
+      // calls for the same tool+params map to one pending entry.
+      const localApprovalId = `breaker:${intentHash.slice(7, 23)}`;
+      if (!breakerPending.has(localApprovalId)) {
+        breakerPending.set(localApprovalId, {
+          key: localApprovalId,
+          toolName: event.toolName,
+          params: event.params ?? {},
+          sessionKey: ctx.sessionKey,
+          sessionId: ctx.sessionId,
+          agentId: ctx.agentId,
+          channelId: ctx.channelId,
+          intentHash,
+          expiresAt: Date.now() + cfg.approvalReplayWindowMs,
+        });
       }
-
+      api.logger.info?.(`vaibot-circuitbreaker: breaker tripped — '${event.toolName}' (${verdict.risk}) held for approval (${localApprovalId})`);
       return {
         block: true,
-        blockReason: `Circuit breaker active — blocked tool: ${event.toolName}`,
+        blockReason:
+          `Circuit breaker active — '${event.toolName}' classified ${verdict.risk} and needs approval.\n` +
+          `Approve: /guard approve ${localApprovalId}\n` +
+          `Deny:    /guard deny ${localApprovalId}`,
       };
     }
 
@@ -1385,9 +1347,6 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
               "Usage:",
               "  /vaibot approve <content_hash>   — approve a pending tool call",
               "  /vaibot deny <content_hash>      — deny a pending tool call",
-              "  /vaibot allowlist add <tool>     — add tool to breaker allowlist",
-              "  /vaibot allowlist list           — show current allowlist",
-              "  /vaibot allowlist skip           — skip allowlist prompt",
             ].join("\n"),
           };
         }
@@ -1414,26 +1373,6 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           }
 
           return { text: `${sub === "approve" ? "Approved" : "Denied"} ${a1}.` };
-        }
-
-        if (sub === "allowlist") {
-          if (a1 === "add" && a2) {
-            if (cfg.breakerAllowlist.includes(a2) || runtimeAllowlist.includes(a2)) {
-              return { text: `'${a2}' is already on the allowlist.` };
-            }
-            runtimeAllowlist.push(a2);
-            persistBreakerState();
-            return { text: `Added '${a2}' to the breaker allowlist. It will pass through automatically on future breaker trips.` };
-          }
-          if (a1 === "list") {
-            const config = cfg.breakerAllowlist.join(", ") || "(none)";
-            const runtime = runtimeAllowlist.length > 0 ? runtimeAllowlist.join(", ") : "(none)";
-            return { text: `Breaker allowlist:\n  Config:  ${config}\n  Runtime: ${runtime}` };
-          }
-          if (a1 === "skip" || !a1) {
-            return { text: "Skipped. The tool will require approval again on future breaker trips." };
-          }
-          return { text: "Usage:\n  /vaibot allowlist add <tool>\n  /vaibot allowlist list\n  /vaibot allowlist skip" };
         }
 
         return { text: "Unknown subcommand. Try: /vaibot help" };
@@ -1478,12 +1417,6 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
               return { text: `Denied ${a1}.` };
             }
             enqueueAutoRetry(localPending);
-            const promptText =
-              `'${localPending.toolName}' was approved during a circuit breaker trip.\n` +
-              `Add it to your permanent allowlist so it passes through automatically next time?\n` +
-              `  Yes: /vaibot allowlist add ${localPending.toolName}\n` +
-              `  No:  /vaibot allowlist skip`;
-            api.runtime.system.enqueueSystemEvent(promptText, { sessionKey: localPending.sessionKey, agentId: localPending.agentId });
             return { text: `Approved ${a1}. Retrying '${localPending.toolName}'.` };
           }
 
