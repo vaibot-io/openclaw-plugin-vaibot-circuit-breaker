@@ -1,0 +1,26 @@
+[Unit]
+Description=VAIBot Guard policy service (user) — OpenClaw host
+# On an OpenClaw host the guard is ordered with the gateway so they start/stop
+# together. The plugin only ever asks systemd to START this unit (it never
+# spawns the daemon itself), so the guard stays a supervised host-singleton.
+After=network-online.target openclaw-gateway.service
+Wants=network-online.target
+PartOf=openclaw-gateway.service
+
+[Service]
+Type=simple
+# `vaibot guard install` (the CLI, the first-class installer) writes the
+# authoritative unit with an absolute ExecStart + WorkingDirectory. This shipped
+# template assumes the vaibot-guard-service bin from @vaibot/guard is on PATH and
+# reads its config (token, API creds, policy, workspace) from the env file.
+EnvironmentFile=%h/.config/vaibot-guard/vaibot-guard.env
+ExecStart=/usr/bin/env vaibot-guard-service
+Restart=on-failure
+RestartSec=2
+
+# Hardening (user-scope, safe defaults)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

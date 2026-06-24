@@ -52,13 +52,22 @@ function resolveExtensionsDir(stateDir) {
   return path.join(stateDir, 'extensions')
 }
 
+// Dev-only / non-shippable dirs that must never be copied into the extensions
+// dir — .git in particular holds read-only objects that EACCES on re-copy.
+const COPY_SKIP = new Set(['.git', 'node_modules', '.DS_Store'])
+
 function copyDir(src, dest) {
   fs.mkdirSync(dest, { recursive: true })
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    if (COPY_SKIP.has(entry.name)) continue
     const srcPath = path.join(src, entry.name)
     const destPath = path.join(dest, entry.name)
     if (entry.isDirectory()) copyDir(srcPath, destPath)
-    else if (entry.isFile()) fs.copyFileSync(srcPath, destPath)
+    else if (entry.isFile()) {
+      // Remove any existing (possibly read-only) target so the copy can't EACCES.
+      try { fs.rmSync(destPath, { force: true }) } catch { /* best-effort */ }
+      fs.copyFileSync(srcPath, destPath)
+    }
   }
 }
 
@@ -106,6 +115,9 @@ function main() {
 try {
   main()
 } catch (err) {
-  process.stderr.write(`[vaibot] postinstall failed: ${err?.message ?? err}\n`)
-  process.exitCode = 1
+  // Auto-wire is a best-effort convenience — never fail the consumer's install
+  // over it. Surface the fallback path and exit 0.
+  process.stderr.write(`[vaibot] postinstall skipped (auto-wire failed, non-fatal): ${err?.message ?? err}\n`)
+  process.stderr.write(`[vaibot] Finish setup with \`vaibot plugin add openclaw\` or \`openclaw plugins install\`.\n`)
+  process.exit(0)
 }

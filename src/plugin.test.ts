@@ -1034,7 +1034,9 @@ describe('createCircuitBreaker integration', () => {
   it('includes VAIBOT_GUARD_TOKEN as authorization header', async () => {
     process.env.VAIBOT_API_KEY = 'test-token'
     process.env.VAIBOT_GUARD_TOKEN = 'guard-secret'
-    const api = makeApi({ decisionChain: ['guard'] })
+    // Explicit guardBaseUrl = connect-only override: use the env token and skip
+    // the rendezvous lock (otherwise a live guard's lock token wins, by design).
+    const api = makeApi({ decisionChain: ['guard'], guardBaseUrl: 'http://127.0.0.1:39111' })
     const { createCircuitBreaker } = await import('./plugin.js')
     createCircuitBreaker(api as any).register()
 

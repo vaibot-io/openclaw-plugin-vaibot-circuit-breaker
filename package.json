@@ -20,6 +20,9 @@
   "openclaw": {
     "extensions": ["./index.ts"]
   },
+  "dependencies": {
+    "@vaibot/guard": "workspace:*"
+  },
   "scripts": {
     "test": "vitest run",
     "test:pack": "node ./scripts/verify-pack.mjs",

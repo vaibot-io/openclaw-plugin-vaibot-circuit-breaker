@@ -14,8 +14,9 @@ import {
   migrateFileIfNeeded,
   envForApiUrl,
   DEFAULT_ENV,
-} from "./creds.mjs";
-import { classify } from "./classifier.mjs";
+} from "@vaibot/guard/creds";
+import { classify } from "@vaibot/guard/classifier";
+import { readLock } from "@vaibot/guard/guard-bootstrap";
 
 // ---- Env isolation ----
 // All process.env reads are collected here. These functions have no network
@@ -284,7 +285,7 @@ function toSessionId(ctx: PluginHookAgentContext): string {
 }
 
 // ---- Credentials ----
-// Shared env-namespaced store (~/.vaibot/credentials.json) via @vaibot/shared.
+// Shared env-namespaced store (~/.vaibot/credentials.json) via @vaibot/guard/creds.
 // Reads/writes are scoped to the env derived from cfg.apiBaseUrl, so a staging
 // bootstrap never clobbers the production slot and vice versa.
 
@@ -396,6 +397,10 @@ export class CircuitBreaker {
 
 export function createCircuitBreaker(api: OpenClawPluginApi) {
   const cfg = resolveConfig(api);
+  // An explicitly-configured guard URL (plugin config or VAIBOT_GUARD_BASE_URL)
+  // means "talk to THIS guard with the env token" — a connect-only override that
+  // skips the rendezvous lock, exactly like the codex/claudecode BASE_URL seam.
+  const guardUrlExplicit = !!((api.pluginConfig as any)?.guardBaseUrl || process.env.VAIBOT_GUARD_BASE_URL);
   const breaker = new CircuitBreaker(cfg);
   const decisionCache = new Map<string, { decision: GuardDecision; meta?: any; expiresAt: number }>();
   const activeRuns = new Map<string, { runId?: string; source: "guard" | "api" | "mcp"; contentHash?: string; replayOf?: string }>();
@@ -464,8 +469,45 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     return `sha256:${await sha256Hex(payload)}`;
   }
 
+  // Discover the live guard via the shared rendezvous lock (~/.vaibot/guard/
+  // guard.json, written by the daemon on bind) so OpenClaw ADOPTS whatever guard
+  // is running — any port, with its token — exactly like the codex/claudecode
+  // plugins, instead of poking a fixed URL with an env token. Falls back to the
+  // configured guardBaseUrl + env token when no lock exists. Cached 5s so a
+  // single decision uses a consistent target.
+  let guardTargetCache: { baseUrl: string; token: string; ts: number } | null = null;
+  function resolveGuardTarget(): { baseUrl: string; token: string } {
+    const now = Date.now();
+    if (guardTargetCache && now - guardTargetCache.ts < 5000) {
+      return { baseUrl: guardTargetCache.baseUrl, token: guardTargetCache.token };
+    }
+    const envToken = readCredential(cfg.guardTokenEnv) || "";
+    let baseUrl = cfg.guardBaseUrl;
+    let token = envToken;
+    try {
+      const lock: any = readLock();
+      if (lock && lock.host && lock.port) {
+        const lockUrl = `http://${lock.host}:${lock.port}`;
+        if (!guardUrlExplicit) {
+          // No explicit override → adopt the running guard wholesale.
+          baseUrl = lockUrl;
+          token = lock.token || envToken;
+        } else if (baseUrl === lockUrl && lock.token) {
+          // Explicit URL that points AT the running guard → still use its real
+          // token, so we don't 401 against a hook-launched guard whose token is
+          // random (the env token may be stale or empty).
+          token = lock.token;
+        }
+      }
+    } catch {
+      /* no lock — use the configured target */
+    }
+    guardTargetCache = { baseUrl, token, ts: now };
+    return { baseUrl, token };
+  }
+
   function getGuardAuthHeaders(): Record<string, string> {
-    const token = readCredential(cfg.guardTokenEnv);
+    const { token } = resolveGuardTarget();
     if (!token) return {};
     return { authorization: `Bearer ${token}` };
   }
@@ -475,12 +517,45 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     if (guardHealthOk !== null && now - guardHealthTs < 5000) return guardHealthOk;
     guardHealthTs = now;
     try {
-      const res = await getJson<{ ok?: boolean }>(`${cfg.guardBaseUrl}/health`, cfg.timeoutMs, getGuardAuthHeaders());
+      const res = await getJson<{ ok?: boolean }>(`${resolveGuardTarget().baseUrl}/health`, cfg.timeoutMs, getGuardAuthHeaders());
       guardHealthOk = !!res?.ok;
     } catch {
       guardHealthOk = false;
     }
     return guardHealthOk;
+  }
+
+  // Two-rung "ensure" run ONCE at plugin load (off the per-call hot path):
+  //   1. adopt   — a healthy guard already on the rendezvous → use it.
+  //   2. systemd — ask the user unit to start the host-singleton guard.
+  // Deliberately NO in-process spawn: OpenClaw stays a thin client and never
+  // becomes a process launcher holding creds. If systemd / the unit is absent,
+  // we degrade to the connect-only + breaker chain (guard-missing is already a
+  // first-class, well-tested path).
+  async function ensureGuardAvailable(): Promise<void> {
+    if (await checkGuardHealth()) {
+      api.logger.info?.("vaibot-circuitbreaker: guard detected (adopted existing)");
+      return;
+    }
+    let systemctlOk = false;
+    try {
+      const { execFile } = await import("node:child_process");
+      systemctlOk = await new Promise<boolean>((resolve) => {
+        execFile("systemctl", ["--user", "start", "vaibot-guard"], { timeout: 6000 }, (err) => resolve(!err));
+      });
+    } catch {
+      systemctlOk = false;
+    }
+    // Bust caches so we re-read the lock the daemon writes on bind.
+    guardHealthOk = null;
+    guardTargetCache = null;
+    if (await checkGuardHealth()) {
+      api.logger.info?.(`vaibot-circuitbreaker: guard started via systemd${systemctlOk ? "" : " (already starting)"}`);
+    } else {
+      api.logger.warn?.(
+        "vaibot-circuitbreaker: no guard running and none could be started (systemd/unit absent) — degrading to breaker/local chain",
+      );
+    }
   }
 
   async function decideWithGuard(event: PluginHookBeforeToolCallEvent, ctx: PluginHookAgentContext) {
@@ -502,7 +577,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     if (approvalId) payload.approval = { approvalId };
 
     const raw = await postJson<GuardToolDecideResponse>(
-      `${cfg.guardBaseUrl}/v1/decide/tool`,
+      `${resolveGuardTarget().baseUrl}/v1/decide/tool`,
       payload,
       cfg.timeoutMs,
       getGuardAuthHeaders(),
@@ -724,7 +799,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     };
 
     try {
-      await postJson(`${cfg.guardBaseUrl}/v1/finalize/tool`, payload, cfg.timeoutMs, getGuardAuthHeaders());
+      await postJson(`${resolveGuardTarget().baseUrl}/v1/finalize/tool`, payload, cfg.timeoutMs, getGuardAuthHeaders());
     } catch (err) {
       api.logger.warn?.(`vaibot-circuitbreaker: guard finalize failed (${String(err)})`);
     }
@@ -862,7 +937,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
 
     // Guard approvals: if approvalId no longer pending, assume approved (best-effort)
     try {
-      const res = await postJson<any>(`${cfg.guardBaseUrl}/v1/approvals/list`, {}, cfg.timeoutMs, getGuardAuthHeaders());
+      const res = await postJson<any>(`${resolveGuardTarget().baseUrl}/v1/approvals/list`, {}, cfg.timeoutMs, getGuardAuthHeaders());
       const pendingIds = new Set((res?.approvals ?? []).map((a: any) => a.approvalId));
       const resolvedGuard: PendingAction[] = [];
       for (const p of pending.values()) {
@@ -1392,7 +1467,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
         }
 
         if (sub === "approvals") {
-          const res = await postJson<any>(`${cfg.guardBaseUrl}/v1/approvals/list`, {}, cfg.timeoutMs, getGuardAuthHeaders());
+          const res = await postJson<any>(`${resolveGuardTarget().baseUrl}/v1/approvals/list`, {}, cfg.timeoutMs, getGuardAuthHeaders());
           const approvals = Array.isArray(res?.approvals) ? res.approvals : [];
           if (approvals.length === 0) return { text: "No pending approvals." };
 
@@ -1420,7 +1495,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             return { text: `Approved ${a1}. Retrying '${localPending.toolName}'.` };
           }
 
-          const out = await postJson<any>(`${cfg.guardBaseUrl}/v1/approvals/resolve`, { approvalId: a1, action: sub }, cfg.timeoutMs, getGuardAuthHeaders());
+          const out = await postJson<any>(`${resolveGuardTarget().baseUrl}/v1/approvals/resolve`, { approvalId: a1, action: sub }, cfg.timeoutMs, getGuardAuthHeaders());
           if (!out?.ok) return { text: `Failed: ${out?.error || "unknown"}` };
 
           if (sub === "approve") {
@@ -1456,14 +1531,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     // otherwise users running api/mcp-only setups pay for an unused localhost
     // probe on every plugin load.
     if (cfg.decisionChain.includes("guard")) {
-      checkGuardHealth()
-        .then((ok) => {
-          if (ok) api.logger.info?.("vaibot-circuitbreaker: guard skill detected (health ok)");
-          else api.logger.warn?.("vaibot-circuitbreaker: guard skill missing or unhealthy");
-        })
-        .catch(() => {
-          api.logger.warn?.("vaibot-circuitbreaker: guard skill missing or unhealthy");
-        });
+      ensureGuardAvailable().catch(() => {
+        api.logger.warn?.("vaibot-circuitbreaker: guard skill missing or unhealthy");
+      });
     }
 
     if (cfg.approvalAutoRetry) {
