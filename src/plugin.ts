@@ -324,7 +324,10 @@ function resolveConfig(api: OpenClawPluginApi): Required<PluginConfig> {
     credsDir: String(cfg.credsDir ?? env.VAIBOT_CREDS_DIR ?? join(homedir(), ".vaibot")),
     agent: String(cfg.agent ?? "openclaw"),
     timeoutMs: Number.isFinite(cfg.timeoutMs) ? Number(cfg.timeoutMs) : 15000,
-    failClosedOnError: cfg.failClosedOnError !== false,
+    // Locked fail-closed: the decision chain must never default open on error.
+    // The old `failClosedOnError: false` escape hatch is removed — fail-closed is
+    // the system-wide posture; use observe mode for non-blocking behavior.
+    failClosedOnError: true,
     sendToolParams: cfg.sendToolParams !== false,
     maxParamChars: Number.isFinite(cfg.maxParamChars) ? Number(cfg.maxParamChars) : 20000,
     maxResultChars: Number.isFinite(cfg.maxResultChars) ? Number(cfg.maxResultChars) : 20000,

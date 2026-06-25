@@ -977,12 +977,12 @@ describe('createCircuitBreaker integration', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  // ---- failClosedOnError false: allow on chain exhaustion ----
+  // ---- failClosedOnError is LOCKED fail-closed (the false escape hatch is removed) ----
 
-  it('allows tool when failClosedOnError=false and chain exhausted', async () => {
+  it('ignores failClosedOnError=false — chain exhaustion still blocks (locked fail-closed)', async () => {
     process.env.VAIBOT_API_KEY = 'test-token'
     const api = makeApi({
-      failClosedOnError: false,
+      failClosedOnError: false, // ignored — locked to true
       decisionChain: ['guard'],
       breakerFailureThreshold: 100, // high so breaker never trips
     })
@@ -994,8 +994,8 @@ describe('createCircuitBreaker integration', () => {
 
     const handler = (api as any).__handlers['before_tool_call']
     const res = await handler(baseEvent, baseCtx)
-    // failClosedOnError=false → should allow
-    expect(res).toBeUndefined()
+    // Locked fail-closed: even failClosedOnError=false now blocks on chain exhaustion.
+    expect(res).toMatchObject({ block: true })
   })
 
   it('blocks tool when failClosedOnError=true and chain exhausted', async () => {
