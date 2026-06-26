@@ -88,14 +88,13 @@ function main() {
   config.plugins = config.plugins ?? {}
   config.plugins.entries = config.plugins.entries ?? {}
 
-  const existing = config.plugins.entries[PLUGIN_ID]
-  if (!existing || existing.path !== pluginDest || existing.enabled !== true) {
-    config.plugins.entries[PLUGIN_ID] = {
-      ...(existing ?? {}),
-      enabled: true,
-      path: pluginDest,
-    }
-  }
+  // Current OpenClaw rejects a `path` key on plugin entries ("Unrecognized key: path"
+  // — it discovers the plugin from the extensions dir by id), and a stale `path` makes
+  // the WHOLE openclaw.json invalid (breaking `openclaw plugins list`). Register with
+  // { enabled: true } only, and strip any `path` left by an older install.
+  const entry = { ...(config.plugins.entries[PLUGIN_ID] ?? {}), enabled: true }
+  delete entry.path
+  config.plugins.entries[PLUGIN_ID] = entry
 
   writeJson(configPath, config)
 
