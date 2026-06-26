@@ -3,6 +3,19 @@
   "version": "0.2.3",
   "license": "MIT",
   "description": "OpenClaw plugin that enforces VAIBot governance decisions with a multi-source decision chain and circuit-breaker fallback.",
+  "keywords": [
+    "openclaw",
+    "claude-code",
+    "codex",
+    "guardrails",
+    "governance",
+    "ai-governance",
+    "circuit-breaker",
+    "vaibot",
+    "audit",
+    "provenance",
+    "security"
+  ],
   "type": "module",
   "main": "index.ts",
   "files": [
