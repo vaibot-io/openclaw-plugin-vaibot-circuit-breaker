@@ -2,12 +2,19 @@
   "id": "circuit-breaker-openclaw-plugin",
   "name": "VAIBot Circuit Breaker v2",
   "description": "OpenClaw Gateway plugin that enforces VAIBot governance decisions with a circuit-breaker fallback.",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "mode": { "type": "string", "enum": ["enforce", "observe"], "default": "enforce" },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "enforce",
+          "observe"
+        ],
+        "default": "enforce"
+      },
       "guardBaseUrl": {
         "type": "string",
         "default": "http://127.0.0.1:39111",
@@ -52,24 +59,98 @@
         "default": "openclaw",
         "description": "Agent identifier sent on bootstrap and recorded on decide receipts."
       },
-      "timeoutMs": { "type": "integer", "minimum": 100, "default": 15000 },
-      "failClosedOnError": { "type": "boolean", "default": true },
-      "sendToolParams": { "type": "boolean", "default": true },
-      "maxParamChars": { "type": "integer", "minimum": 1000, "default": 20000 },
-      "maxResultChars": { "type": "integer", "minimum": 1000, "default": 20000 },
-      "decisionCacheTtlMs": { "type": "integer", "minimum": 0, "default": 5000 },
-      "breakerFailureThreshold": { "type": "integer", "minimum": 1, "default": 3 },
-      "breakerWindowMs": { "type": "integer", "minimum": 1000, "default": 10000 },
-      "breakerCooldownMs": { "type": "integer", "minimum": 1000, "default": 60000 },
-      "breakerAllowlist": { "type": "array", "items": { "type": "string" }, "default": ["read", "web_fetch"] },
-      "breakerDenylist": { "type": "array", "items": { "type": "string" }, "default": [] },
-      "approvalAutoRetry": { "type": "boolean", "default": true },
-      "approvalPollMs": { "type": "integer", "minimum": 1000, "default": 15000 },
-      "approvalReplayWindowMs": { "type": "integer", "minimum": 60000, "default": 1800000 },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 100,
+        "default": 15000
+      },
+      "failClosedOnError": {
+        "type": "boolean",
+        "default": true
+      },
+      "sendToolParams": {
+        "type": "boolean",
+        "default": true
+      },
+      "maxParamChars": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 20000
+      },
+      "maxResultChars": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 20000
+      },
+      "decisionCacheTtlMs": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 5000
+      },
+      "breakerFailureThreshold": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 3
+      },
+      "breakerWindowMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 10000
+      },
+      "breakerCooldownMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 60000
+      },
+      "breakerAllowlist": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "read",
+          "web_fetch"
+        ]
+      },
+      "breakerDenylist": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "approvalAutoRetry": {
+        "type": "boolean",
+        "default": true
+      },
+      "approvalPollMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 15000
+      },
+      "approvalReplayWindowMs": {
+        "type": "integer",
+        "minimum": 60000,
+        "default": 1800000
+      },
       "decisionChain": {
         "type": "array",
-        "items": { "type": "string", "enum": ["guard", "mcp", "api", "breaker", "skill"] },
-        "default": ["guard", "mcp", "api", "breaker"],
+        "items": {
+          "type": "string",
+          "enum": [
+            "guard",
+            "mcp",
+            "api",
+            "breaker",
+            "skill"
+          ]
+        },
+        "default": [
+          "guard",
+          "mcp",
+          "api",
+          "breaker"
+        ],
         "description": "Decision sources in order. 'skill' is an alias for 'guard'."
       }
     }
