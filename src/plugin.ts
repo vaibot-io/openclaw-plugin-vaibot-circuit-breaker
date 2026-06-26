@@ -14,9 +14,9 @@ import {
   migrateFileIfNeeded,
   envForApiUrl,
   DEFAULT_ENV,
-} from "@vaibot/guard/creds";
-import { classify } from "@vaibot/guard/classifier";
-import { readLock } from "@vaibot/guard/guard-bootstrap";
+} from "../vendor/vaibot-guard/scripts/lib/creds.mjs";
+import { classify } from "../vendor/vaibot-guard/scripts/classifier.mjs";
+import { readLock } from "../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs";
 
 // ---- Env isolation ----
 // All process.env reads are collected here. These functions have no network

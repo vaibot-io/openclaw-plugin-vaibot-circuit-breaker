@@ -28,13 +28,11 @@
     "src/openclaw-plugin-sdk.d.ts",
     "systemd/**",
     "references/**",
-    "assets/**"
+    "assets/**",
+    "vendor/**"
   ],
   "openclaw": {
     "extensions": ["./index.ts"]
-  },
-  "dependencies": {
-    "@vaibot/guard": "workspace:*"
   },
   "scripts": {
     "test": "vitest run",
@@ -42,6 +40,7 @@
     "postinstall": "node ./scripts/postinstall.mjs"
   },
   "devDependencies": {
+    "@vaibot/guard": "workspace:*",
     "vitest": "^2.0.0"
   }
 }
