@@ -379,6 +379,26 @@ describe('createCircuitBreaker integration', () => {
     expect(res).toEqual({ block: true, blockReason: 'too risky' })
   })
 
+  it('guard-published effective_mode=observe overrides cfg.mode=enforce (deny → observe-allow)', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi() // cfg.mode is 'enforce' for this suite
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    // The guard resolves the account to observe and PUBLISHES it. Even though the
+    // local cfg.mode is 'enforce', the plugin must honor the guard's mode on the
+    // guard path and NOT block the deny — this is the account-flips-to-observe
+    // recovery path working end-to-end without touching the plugin config.
+    mockFetch(
+      { ok: true }, // guard health
+      { ok: true, decision: { decision: 'deny', reason: 'too risky' }, runId: 'g1', effective_mode: 'observe' },
+    )
+
+    const handler = (api as any).__handlers['before_tool_call']
+    const res = await handler(baseEvent, baseCtx)
+    expect(res).toBeUndefined() // observe: logged, not blocked (guard mode wins over cfg.mode)
+  })
+
   it('falls through to API when both guard and MCP fail', async () => {
     process.env.VAIBOT_API_KEY = 'test-token'
     const api = makeApi()

@@ -100,6 +100,7 @@ type GuardToolDecideResponse = {
   risk?: unknown;
   audit?: unknown;
   error?: string;
+  effective_mode?: Mode; // guard-published server-resolved account mode
 };
 
 type VaibotApiDecision = {
@@ -1136,13 +1137,21 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           if (!guardOk) throw new Error("Guard health check failed (skill missing or unhealthy)");
 
           const { decision, raw } = await decideWithGuard(event, ctx);
+          // Guard-published account mode is authoritative on this ONLINE guard path;
+          // fall back to the local cfg.mode-derived observeOnly only when the guard
+          // is older/silent (effective_mode absent). Other sources (mcp/api) and the
+          // breaker path keep observeOnly — no guard answer governs them.
+          const guardObserveOnly =
+            raw?.effective_mode === "observe" ? true
+            : raw?.effective_mode === "enforce" ? false
+            : observeOnly;
           breaker.recordSuccess();
           persistBreakerState();
           if (lastTripLogged) api.logger.info?.("vaibot-circuitbreaker: breaker CLEARED (guard)");
           lastTripLogged = false;
           api.logger.info?.(`vaibot-circuitbreaker: decision source=guard decision=${decision.decision}`);
 
-          if (decision.decision === "allow" && cfg.decisionCacheTtlMs > 0 && !observeOnly) {
+          if (decision.decision === "allow" && cfg.decisionCacheTtlMs > 0 && !guardObserveOnly) {
             decisionCache.set(ck, { decision, meta: raw, expiresAt: Date.now() + cfg.decisionCacheTtlMs });
           }
 
@@ -1157,7 +1166,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           }
 
           if (decision.decision === "approve") {
-            if (observeOnly) { observeAllow("guard", decision); return; }
+            if (guardObserveOnly) { observeAllow("guard", decision); return; }
             // Bug #4 fix: Guard returns approvalId/expiresAt/scope at the top level of raw,
             // NOT nested inside raw.decision
             const approvalId = raw?.approvalId as string | undefined;
@@ -1200,7 +1209,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           }
 
           // deny
-          if (observeOnly) { observeAllow("guard", decision); return; }
+          if (guardObserveOnly) { observeAllow("guard", decision); return; }
           return {
             block: true,
             blockReason: decision.reason || `Denied by VAIBot-Guard for tool: ${event.toolName}`,
