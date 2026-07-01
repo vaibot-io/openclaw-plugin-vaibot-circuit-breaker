@@ -1286,9 +1286,9 @@ describe('auto-bootstrap and claim nudge', () => {
     const credsPath = path.join(testCredsDir, 'credentials.json')
     expect(fs.existsSync(credsPath)).toBe(true)
     const saved = JSON.parse(fs.readFileSync(credsPath, 'utf-8'))
-    // v2 env-namespaced slim store: prod (default apiBaseUrl) slot holds only
+    // v3 env-namespaced slim store: prod (default apiBaseUrl) slot holds only
     // api_key + wallet_address; account_id/user_id/api_url/etc. are not stored.
-    expect(saved.version).toBe(2)
+    expect(saved.version).toBe(3)
     expect(saved.active_env).toBe('production')
     expect(saved.environments.production.api_key).toBe('boot_k2')
     expect(saved.environments.production.wallet_address).toBe('0xdef')
