@@ -190,7 +190,14 @@ To restore full (server-backed) governance, get a key back — any one:
 - copy your key from **https://www.vaibot.io** → set `VAIBOT_API_KEY`,
 - or check `~/.vaibot/credentials.json`.
 
-> Heads-up: unlike the Claude Code / Codex plugins (which govern locally when keyless), this gateway plugin currently **fail-closes** if it can't resolve an API key — keep a key available, or use observe as above. (Keyless local-governance for OpenClaw is on the roadmap.)
+### No API key never bricks the agent
+
+A missing or unprovisionable key does **not** fail-closed — parity with the Claude Code /
+Codex plugins. When no server-backed source can decide (the guard is unreachable and/or
+there's no key), the plugin **governs locally** with the built-in classifier: the
+catastrophic floor + denylist block, classifier-safe tools pass (so work continues and you
+can recover), and risky tools are **held for approval** via the gateway (`/guard approve`).
+Restore full server-backed governance with `vaibot login` or by setting `VAIBOT_API_KEY`.
 
 ## Community & support
 
