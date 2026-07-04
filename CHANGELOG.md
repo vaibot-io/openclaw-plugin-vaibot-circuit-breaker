@@ -2,14 +2,21 @@
 
 All notable changes to `@vaibot/circuit-breaker-openclaw-plugin`.
 
-## [Unreleased] — vendored guard refresh
+## [1.1.0] — 2026-07-04 — graceful degrade + honest receipts
 
 ### Changed
-- Synced vendored `@vaibot/guard` to the fresh-install release: system-config
-  commands (`systemctl` / `service` / `launchctl` / `crontab` / `cron`) now escalate
-  to **human approval on the command head** instead of hard-denying;
-  `policy.default.json` v0.3 (empty `denyTokens`); and the launcher tees the daemon's
-  boot output to `~/.vaibot/guard/launch.log` with a 10s cold-start budget.
+- **Keyless / guard-down now degrades to the local classifier instead of blanket-blocking.**
+  When the decision chain is exhausted (no key, or the guard unreachable), the plugin governs
+  locally: classifier-safe tools pass, the denylist + catastrophic floor block, and risky
+  tools are held — so a missing key or a transient outage no longer dead-ends every tool.
+  `bootstrap`/network failures degrade to this floor rather than throwing.
+- Re-vendored `@vaibot/guard` 2.1.0:
+  - destructive host-config verbs hard-deny (`systemctl stop|disable|mask`, `service … stop`,
+    `launchctl unload|remove|bootout`, `crontab` install) — matched on wrapped/absolute/`sh -c`
+    forms, un-overridable by any preset;
+  - the guard's OWN lifecycle is allow-listed (systemd + macOS `launchctl io.vaibot.guard` +
+    CLI + the `:39111` health probe), so managing the guard never prompts; teardown still denies;
+  - honest receipts: `risk_level` matches the decision, and an allowed action reads `allowed`.
 
 ### Notes
 - OpenClaw already defaults to **`enforce`** (`cfg.mode ?? "enforce"`) via plugin

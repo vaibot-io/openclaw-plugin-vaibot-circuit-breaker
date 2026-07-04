@@ -1,5 +1,7 @@
 # @vaibot/circuit-breaker-openclaw-plugin
 
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/mc2HuR2kgG)
+
 OpenClaw Gateway plugin that enforces VAIBot governance decisions on every tool call — with a local circuit breaker that keeps protection active even when the API is unreachable.
 
 VAIBot classifies each tool call against your governance policy and returns an allow, deny, or approval-required decision before the tool executes. Every decision creates a tamper-evident receipt with on-chain provenance anchoring.
@@ -201,7 +203,7 @@ Restore full server-backed governance with `vaibot login` or by setting `VAIBOT_
 
 ## Community & support
 
-**[Join the VAIBot Discord](https://discord.gg/mSHYtP5nV)** — get help, share feedback, and connect with other users.
+**[Join the VAIBot Discord](https://discord.gg/mc2HuR2kgG)** — get help, share feedback, and connect with other users.
 
 VAIBot is in early access. If you're installing this plugin now, you're among the first operators putting verifiable AI governance into production. Early community members shape the roadmap directly — feature requests, policy design, and integration patterns all come from conversations in Discord.
 
@@ -216,16 +218,4 @@ To become a founding member, join the Discord and introduce yourself in **#found
 ```bash
 openclaw plugins uninstall circuit-breaker-openclaw-plugin
 openclaw gateway restart
-```
-
----
-
-## Local dev install
-
-When installing from a local path or tarball, OpenClaw's safety scanner may flag the plugin because it reads environment variables and makes network calls (expected behaviour for a governance plugin). Use `--dangerously-force-unsafe-install` to acknowledge this:
-
-```bash
-openclaw plugins install --dangerously-force-unsafe-install ./vaibot-circuit-breaker-openclaw-plugin-0.2.2.tgz
-openclaw gateway restart
-openclaw plugins inspect circuit-breaker-openclaw-plugin
 ```
