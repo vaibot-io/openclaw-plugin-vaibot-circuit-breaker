@@ -325,9 +325,13 @@ function resolveConfig(api: OpenClawPluginApi): Required<PluginConfig> {
     credsDir: String(cfg.credsDir ?? env.VAIBOT_CREDS_DIR ?? join(homedir(), ".vaibot")),
     agent: String(cfg.agent ?? "openclaw"),
     timeoutMs: Number.isFinite(cfg.timeoutMs) ? Number(cfg.timeoutMs) : 15000,
-    // Locked fail-closed: the decision chain must never default open on error.
-    // The old `failClosedOnError: false` escape hatch is removed — fail-closed is
-    // the system-wide posture; use observe mode for non-blocking behavior.
+    // Never default-open: the chain must not blanket-allow when governance is
+    // unreachable. When all server-backed sources (guard/mcp/api) are exhausted — the
+    // guard is down and/or there's no API key — we degrade to the LOCAL classifier floor
+    // (see localFloorDecision): catastrophic floor + denylist block, classifier-safe
+    // passes (agent not bricked, can recover), risky is held for approval. This matches
+    // the claudecode/codex plugins' guard-down degrade. `failClosedOnError` stays locked;
+    // observe mode remains the fully non-blocking path.
     failClosedOnError: true,
     sendToolParams: cfg.sendToolParams !== false,
     maxParamChars: Number.isFinite(cfg.maxParamChars) ? Number(cfg.maxParamChars) : 20000,
@@ -607,6 +611,81 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     const fromEnv = readCredential(cfg.mcpTokenEnv);
     if (fromEnv) return fromEnv;
     return bootstrappedKey ?? "";
+  }
+
+  /**
+   * Local classifier floor — the terminal fallback when NO server-backed source
+   * (guard/mcp/api) could decide: the guard is unreachable, and/or there's no API key
+   * so mcp/api can't run (the keyless case). This is IDENTICAL in spirit to the
+   * claudecode/codex plugins' guard-down degrade and to this plugin's own
+   * breaker-tripped path: govern LOCALLY instead of bricking the agent.
+   *
+   *   denylist / classifier DENY (catastrophic floor) → block (un-approvable)
+   *   classifier ALLOW (safe)                          → pass (agent still works + can
+   *                                                       recover via `vaibot login`)
+   *   ambiguous / risky                                → HELD for human approval
+   *
+   * Returns `undefined` to allow, or a block decision. Observe mode always passes.
+   */
+  function localFloorDecision(
+    event: PluginHookBeforeToolCallEvent,
+    ctx: PluginHookAgentContext,
+    intentHash: string,
+    observeOnly: boolean,
+    label: string,
+  ): { block: true; blockReason: string } | undefined {
+    const verdict = classify({ tool: event.toolName, input: event.params ?? {} });
+    const isDenied = cfg.breakerDenylist.includes(event.toolName);
+
+    if (observeOnly) {
+      const v = isDenied
+        ? "would block (denylist)"
+        : verdict.verdictHint === "deny"
+          ? "would block (floor)"
+          : verdict.verdictHint === "allow"
+            ? "would allow (classifier-safe)"
+            : "would hold for approval";
+      api.logger.info?.(`vaibot-circuitbreaker [observe]: ${label} — ${v} ${event.toolName}`);
+      return undefined;
+    }
+
+    if (isDenied) {
+      return { block: true, blockReason: `VAIBot ${label} — denylisted tool: ${event.toolName}` };
+    }
+    if (verdict.verdictHint === "deny") {
+      return {
+        block: true,
+        blockReason: `VAIBot floor — ${event.toolName} blocked (${verdict.reasons?.[0] ?? "catastrophic action"}), enforced with no reachable governance.`,
+      };
+    }
+    if (verdict.verdictHint === "allow") {
+      api.logger.info?.(`vaibot-circuitbreaker: ${label} — classifier pass-through (${verdict.risk}) for ${event.toolName}`);
+      return undefined;
+    }
+
+    // Ambiguous / risky → hold for local human approval (OpenClaw's strength).
+    const localApprovalId = `breaker:${intentHash.slice(7, 23)}`;
+    if (!breakerPending.has(localApprovalId)) {
+      breakerPending.set(localApprovalId, {
+        key: localApprovalId,
+        toolName: event.toolName,
+        params: event.params ?? {},
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        channelId: ctx.channelId,
+        intentHash,
+        expiresAt: Date.now() + cfg.approvalReplayWindowMs,
+      });
+    }
+    api.logger.info?.(`vaibot-circuitbreaker: ${label} — '${event.toolName}' (${verdict.risk}) held for approval (${localApprovalId})`);
+    return {
+      block: true,
+      blockReason:
+        `VAIBot ${label} — '${event.toolName}' classified ${verdict.risk} and needs approval.\n` +
+        `Approve: /guard approve ${localApprovalId}\n` +
+        `Deny:    /guard deny ${localApprovalId}`,
+    };
   }
 
   /**
@@ -1379,7 +1458,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           }
 
           if ((cfg.failClosedOnError || breaker.isTripped()) && !observeOnly) {
-            return { block: true, blockReason: msg };
+            // Server-backed sources exhausted → local classifier floor, NOT a blanket
+            // block (parity with the breaker-tripped path + claudecode/codex guard-down).
+            return localFloorDecision(event, ctx, intentHash, observeOnly, "governance unreachable");
           }
         }
       }
@@ -1392,9 +1473,11 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       return;
     }
 
-    if (cfg.failClosedOnError) {
-      return { block: true, blockReason: "VAIBot decision chain exhausted" };
-    }
+    // Chain exhausted (no server-backed source could decide) → govern LOCALLY with the
+    // classifier instead of bricking: floor + denylist block, classifier-safe passes (so
+    // the agent still works + can recover), risky held. Matches claudecode/codex.
+    const localExhaust = localFloorDecision(event, ctx, intentHash, observeOnly, "governance unreachable");
+    if (localExhaust) return localExhaust;
 
     // Fallthrough without failClosedOnError: allow and clean up replay.
     if (replayOf) {

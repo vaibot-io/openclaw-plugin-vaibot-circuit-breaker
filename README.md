@@ -167,11 +167,37 @@ Set in `~/.openclaw/.env` or your service environment:
 
 **enforce** (default) — tool calls are blocked when the policy says deny or approval_required.
 
-**observe** — all tool calls proceed, but the policy verdict is logged. Useful for auditing before enabling enforcement.
+**observe** — all tool calls proceed, but the policy verdict is logged (except the catastrophic floor). Useful for auditing before enabling enforcement — and as the **escape hatch** if enforcement ever blocks you.
 
 ```json
 { "config": { "mode": "observe" } }
 ```
+
+## Recovery / escape hatch
+
+If governance ever blocks the gateway and you need out **now**, set the plugin to observe and restart:
+
+```json
+{ "config": { "mode": "observe" } }
+```
+
+```bash
+openclaw gateway restart
+```
+
+To restore full (server-backed) governance, get a key back — any one:
+- `vaibot login`,
+- copy your key from **https://www.vaibot.io** → set `VAIBOT_API_KEY`,
+- or check `~/.vaibot/credentials.json`.
+
+### No API key never bricks the agent
+
+A missing or unprovisionable key does **not** fail-closed — parity with the Claude Code /
+Codex plugins. When no server-backed source can decide (the guard is unreachable and/or
+there's no key), the plugin **governs locally** with the built-in classifier: the
+catastrophic floor + denylist block, classifier-safe tools pass (so work continues and you
+can recover), and risky tools are **held for approval** via the gateway (`/guard approve`).
+Restore full server-backed governance with `vaibot login` or by setting `VAIBOT_API_KEY`.
 
 ## Community & support
 

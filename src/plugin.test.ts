@@ -999,26 +999,27 @@ describe('createCircuitBreaker integration', () => {
 
   // ---- failClosedOnError is LOCKED fail-closed (the false escape hatch is removed) ----
 
-  it('ignores failClosedOnError=false — chain exhaustion still blocks (locked fail-closed)', async () => {
+  it('chain exhaustion degrades to the local classifier — safe passes, risky held', async () => {
     process.env.VAIBOT_API_KEY = 'test-token'
     const api = makeApi({
-      failClosedOnError: false, // ignored — locked to true
       decisionChain: ['guard'],
-      breakerFailureThreshold: 100, // high so breaker never trips
+      breakerFailureThreshold: 100, // high so the breaker never trips
     })
     const { createCircuitBreaker } = await import('./plugin.js')
     createCircuitBreaker(api as any).register()
 
-    // Guard health fail → chain exhausted with no success
-    mockFetch({ ok: false })
+    // Guard unreachable → chain exhausted with no server-backed decision.
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network down')) as any
 
     const handler = (api as any).__handlers['before_tool_call']
-    const res = await handler(baseEvent, baseCtx)
-    // Locked fail-closed: even failClosedOnError=false now blocks on chain exhaustion.
-    expect(res).toMatchObject({ block: true })
+    // Safe tool (write /tmp) passes locally — the agent is NOT bricked.
+    expect(await handler(baseEvent, baseCtx)).toBeUndefined()
+    // Risky/unknown tool is held for local approval — the floor still governs.
+    const risky = await handler({ toolName: 'frobnicate_widget', params: {}, runId: 'r9', toolCallId: 't9' }, baseCtx)
+    expect(risky).toMatchObject({ block: true })
   })
 
-  it('blocks tool when failClosedOnError=true and chain exhausted', async () => {
+  it('chain exhaustion holds a risky tool for local approval (floor)', async () => {
     process.env.VAIBOT_API_KEY = 'test-token'
     const api = makeApi({
       failClosedOnError: true,
@@ -1028,25 +1029,28 @@ describe('createCircuitBreaker integration', () => {
     const { createCircuitBreaker } = await import('./plugin.js')
     createCircuitBreaker(api as any).register()
 
-    mockFetch({ ok: false })
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network down')) as any
 
     const handler = (api as any).__handlers['before_tool_call']
-    const res = await handler(baseEvent, baseCtx)
-    expect(res).toEqual({ block: true, blockReason: 'VAIBot decision chain exhausted' })
+    const res = await handler({ toolName: 'frobnicate_widget', params: {}, runId: 'rx', toolCallId: 'tx' }, baseCtx)
+    expect(res).toMatchObject({ block: true })
+    expect(res.blockReason).toContain('needs approval')
   })
 
-  // ---- MCP missing token ----
+  // ---- MCP missing token: keyless degrade to the local classifier ----
 
-  it('MCP source fails when token env is not set', async () => {
-    // Deliberately no VAIBOT_API_KEY
+  it('MCP source without a token degrades to the local classifier (keyless)', async () => {
+    // Deliberately no VAIBOT_API_KEY → mcp has no token → chain exhausts → local floor.
     const api = makeApi({ decisionChain: ['mcp'], breakerFailureThreshold: 100 })
     const { createCircuitBreaker } = await import('./plugin.js')
     createCircuitBreaker(api as any).register()
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network down')) as any
 
     const handler = (api as any).__handlers['before_tool_call']
-    const res = await handler(baseEvent, baseCtx)
-    // failClosedOnError=true → blocks
-    expect(res?.block).toBe(true)
+    // Safe tool passes locally (no brick); risky is held.
+    expect(await handler(baseEvent, baseCtx)).toBeUndefined()
+    const risky = await handler({ toolName: 'frobnicate_widget', params: {}, runId: 'rm', toolCallId: 'tm' }, baseCtx)
+    expect(risky?.block).toBe(true)
   })
 
   // ---- Guard sends auth header ----
@@ -1246,8 +1250,9 @@ describe('auto-bootstrap and claim nudge', () => {
     const handler = (api as any).__handlers['before_tool_call']
     const res = await handler(baseEvent, baseCtx)
 
-    // No key → decide throws → chain exhausted → fail-closed block
-    expect(res?.block).toBe(true)
+    // No key → bootstrap warns → chain exhausts → LOCAL classifier governs (not bricked);
+    // baseEvent is a safe write, so it passes locally.
+    expect(res).toBeUndefined()
     expect((api as any).__logs.some((l: any) => l.level === 'warn' && /bootstrap failed/.test(l.msg))).toBe(true)
   })
 
