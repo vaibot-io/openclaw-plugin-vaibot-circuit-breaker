@@ -25,6 +25,16 @@ Most deployments use both: the plugin for mandatory pre-execution enforcement, t
 
 ## Install
 
+**Recommended — install the whole stack in one command.** The `vaibot` CLI is the entry point: it installs the guard, detects and wires your agents (including OpenClaw), and sets a policy floor. macOS + Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vaibot-io/command-cli/main/install.sh | sh
+```
+
+### Just the plugin
+
+Or install only the plugin into OpenClaw:
+
 ```bash
 openclaw plugins install @vaibot/circuit-breaker-openclaw-plugin
 openclaw gateway restart
