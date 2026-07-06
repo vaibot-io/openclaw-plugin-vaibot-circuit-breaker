@@ -724,9 +724,11 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     }
 
     if (res?.bootstrapped === false) {
+      // Account exists but the local key was lost. Offer BOTH recovery paths.
       api.logger.warn?.(
-        `vaibot-circuitbreaker: account already provisioned but no api_key returned. ` +
-          `Set ${cfg.apiKeyEnv} manually or check ${join(cfg.credsDir, "credentials.json")}.`,
+        `vaibot-circuitbreaker: account exists but no api_key found locally. Recover access by either ` +
+          `running \`vaibot login\` (re-issues a key), or setting ${cfg.apiKeyEnv} / checking ` +
+          `${join(cfg.credsDir, "credentials.json")}.`,
       );
       return;
     }
