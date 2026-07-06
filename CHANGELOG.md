@@ -2,6 +2,14 @@
 
 All notable changes to `@vaibot/circuit-breaker-openclaw-plugin`.
 
+## [1.2.0] — 2026-07-05 — account key recovery
+
+### Changed
+- On `bootstrapped:false` (account exists but no local API key — e.g. the key was
+  lost), the plugin now warns with **both** recovery paths instead of a dead end:
+  run `vaibot login` (re-issues a key via your session) **or** set the api-key env /
+  check `credentials.json`. Both are valid; neither replaces the other.
+
 ## [1.1.0] — 2026-07-04 — graceful degrade + honest receipts
 
 ### Changed
