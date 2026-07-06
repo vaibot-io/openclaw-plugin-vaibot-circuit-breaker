@@ -1268,7 +1268,10 @@ describe('auto-bootstrap and claim nudge', () => {
     await handler(baseEvent, baseCtx)
 
     expect((api as any).__logs.some((l: any) =>
-      l.level === 'warn' && /already provisioned but no api_key returned/.test(l.msg)
+      l.level === 'warn' &&
+      /no api_key found locally/.test(l.msg) &&
+      /vaibot login/.test(l.msg) &&      // recovery path 1
+      /checking .*credentials\.json/.test(l.msg) // recovery path 2 (manual)
     )).toBe(true)
   })
 
