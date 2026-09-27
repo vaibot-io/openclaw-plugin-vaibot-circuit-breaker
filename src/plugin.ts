@@ -16,7 +16,7 @@ import {
   DEFAULT_ENV,
 } from "../vendor/vaibot-guard/scripts/lib/creds.mjs";
 import { classify } from "../vendor/vaibot-guard/scripts/classifier.mjs";
-import { readLock } from "../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs";
+import { readLock, readContainment } from "../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs";
 
 // ---- Env isolation ----
 // All process.env reads are collected here. These functions have no network
@@ -1108,6 +1108,26 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     event: PluginHookBeforeToolCallEvent,
     ctx: PluginHookAgentContext,
   ): Promise<PluginHookBeforeToolCallResult | void> {
+    // CONTAINMENT — first, ahead of the key gate, the decision chain, the breaker
+    // and the observe branch below. Those are exactly the paths an account-wide
+    // stop has to survive: a call that never reaches the daemon would otherwise be
+    // decided locally, and observe mode would let it through with only a log line.
+    // The machine-wide record needs no daemon, no network and no credentials.
+    //
+    // No governance-tool exemption is needed here, unlike the subprocess breakers:
+    // the operator's path is the `/vaibot` slash commands registered in
+    // registerCommands(), which the gateway does not route through
+    // before_tool_call. Containment therefore cannot lock an operator out.
+    const containment = readContainment();
+    if (containment.contained) {
+      const why = containment.reason ? ` (${containment.reason})` : "";
+      const blockReason =
+        `VAIBot containment engaged${why} — every action on this account is blocked, on every machine. ` +
+        "Lift it from the dashboard or with `vaibot release`.";
+      api.logger.warn?.(`vaibot-circuitbreaker: ${blockReason}`);
+      return { block: true, blockReason };
+    }
+
     // Wait for any in-flight auto-bootstrap so the decision chain sees a
     // resolved API key. Errors are already logged inside bootstrap().
     if (bootstrapPromise) {
