@@ -39,10 +39,13 @@
   "scripts": {
     "test": "vitest run",
     "test:pack": "node ./scripts/verify-pack.mjs",
-    "postinstall": "node ./scripts/postinstall.mjs"
+    "postinstall": "node ./scripts/postinstall.mjs",
+    "typecheck": "tsc --noEmit -p ."
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "@vaibot/guard": "workspace:*",
+    "typescript": "^5.0.0",
     "vitest": "^2.0.0"
   }
 }

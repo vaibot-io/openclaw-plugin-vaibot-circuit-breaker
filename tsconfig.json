@@ -1,0 +1,31 @@
+{
+  // This package ships raw TypeScript — `main` is index.ts and there is no build
+  // step — so nothing compiled it and, until this file existed, nothing checked it
+  // either. The tests run under vitest, which strips types rather than checking
+  // them, and the monorepo's `tsc -b` stops on unrelated errors before reaching
+  // here. The result: 1.3.0 shipped an import of `readContainment` that did not
+  // typecheck against the vendored guard declarations. Runtime was fine, because a
+  // .d.mts does not exist at runtime, but nothing local would have said so.
+  //
+  // noEmit: this is a checker, not a build. The host loads the .ts directly.
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "lib": ["es2022"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    // The vendored guard is a committed copy of a published package, checked in its
+    // own repo and re-vendored verbatim. Its declarations are still *used* — this
+    // only skips checking them internally, so an import that relies on a missing
+    // export still fails, which is the whole point of adding this file.
+    "skipLibCheck": true
+  },
+  "include": ["index.ts", "src/**/*.ts"],
+  "exclude": ["vendor", "node_modules"]
+}

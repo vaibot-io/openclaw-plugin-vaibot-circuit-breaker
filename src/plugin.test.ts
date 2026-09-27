@@ -928,7 +928,7 @@ describe('createCircuitBreaker integration', () => {
     const { createCircuitBreaker } = await import('./plugin.js')
     createCircuitBreaker(api as any).register()
 
-    const fetchMock = mockFetch(
+    mockFetch(
       { ok: true }, // guard health
       { ok: true, decision: { decision: 'allow' }, runId: 'guard_run_fin' }, // guard decide
     )

@@ -913,7 +913,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     }
   }
 
-  async function finalizeApi(event: PluginHookAfterToolCallEvent, ctx: PluginHookAgentContext, runId?: string) {
+  async function finalizeApi(event: PluginHookAfterToolCallEvent, _ctx: PluginHookAgentContext, runId?: string) {
     if (!runId) {
       api.logger.warn?.("vaibot-circuitbreaker: api finalize skipped (no runId)");
       return;
@@ -1531,7 +1531,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       handler: async (ctx) => {
         const args = String(ctx.args || "").trim();
         const parts = args.split(/\s+/);
-        const [sub, a1, a2] = parts;
+        const [sub, a1] = parts;
 
         if (!sub || sub === "help") {
           return {
