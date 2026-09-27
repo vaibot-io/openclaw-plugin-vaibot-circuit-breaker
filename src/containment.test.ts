@@ -52,13 +52,18 @@ const baseCtx = { sessionId: 's1', agentId: 'a1', workspaceDir: '/tmp', sessionK
 
 function makeApi(overrides: Record<string, unknown> = {}) {
   const handlers: Record<string, any> = {}
+  const commands: Record<string, any> = {}
   const logs: { level: string; msg: string }[] = []
+  const systemEvents: unknown[][] = []
   return {
     pluginConfig: { ...baseCfg, ...overrides },
     runtime: {
       state: { resolveStateDir: () => '/tmp' },
       config: { writeConfigFile: () => {}, loadConfig: () => ({}) },
-      system: { enqueueSystemEvent: () => {} },
+      // enqueueAutoRetry fires a system event when it registers a replay
+      // pointer, so recording these gives a test a way to prove the pointer was
+      // actually set rather than assuming it.
+      system: { enqueueSystemEvent: (...args: unknown[]) => { systemEvents.push(args) } },
     },
     logger: {
       info: (msg: string) => logs.push({ level: 'info', msg }),
@@ -66,10 +71,24 @@ function makeApi(overrides: Record<string, unknown> = {}) {
       error: (msg: string) => logs.push({ level: 'error', msg }),
     },
     on: (name: string, fn: any) => { handlers[name] = fn },
-    registerCommand: () => {},
+    registerCommand: (cmd: any) => { commands[cmd.name] = cmd },
     __handlers: handlers,
+    __commands: commands,
     __logs: logs,
+    __systemEvents: systemEvents,
   }
+}
+
+// Queue of fetch responses, in order.
+function mockFetch(...responses: unknown[]) {
+  const calls: unknown[][] = []
+  const fn = (...args: unknown[]) => {
+    calls.push(args)
+    const body = responses.shift() ?? { ok: true }
+    return Promise.resolve({ text: async () => JSON.stringify(body), status: 200 } as any)
+  }
+  globalThis.fetch = fn as any
+  return calls
 }
 
 // A fetch that fails the assertion if it is ever reached: containment must not
@@ -139,6 +158,54 @@ describe('containment', () => {
     const { handler } = await gate()
     const res = await handler(baseEvent, baseCtx).catch(() => undefined)
     expect(res?.blockReason ?? '').not.toMatch(/containment engaged/i)
+  })
+
+  it('an approved replay pointer does NOT survive containment', async () => {
+    // The guarantee: containment is read before the intent hash is built and
+    // before the replay map is consulted, so a decision approved BEFORE
+    // containment was engaged cannot carry a later call through. Line order in
+    // onBeforeToolCall is what makes that true; this asserts it, so a refactor
+    // that moves the check below the replay lookup fails here rather than in an
+    // incident.
+    try { rmSync(join(sandboxHome, '.vaibot', 'guard', 'containment.json'), { force: true }) } catch { /* fine */ }
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const originalFetch = globalThis.fetch
+    try {
+      const { api, handler } = await gate({ decisionChain: ['api'] })
+
+      // 1. Not contained: a call that needs approval, which registers a pending
+      //    action keyed by its content hash.
+      mockFetch({
+        ok: true,
+        run_id: 'run_replay',
+        decision: { decision: 'approval_required', reason: 'Needs review' },
+        content_hash: 'sha256:replay1',
+      })
+      const first = await handler(baseEvent, baseCtx)
+      expect(first?.block).toBe(true)
+      expect(first?.blockReason ?? '').not.toMatch(/containment engaged/i)
+
+      // 2. Approve it, which is what registers the replay pointer for this
+      //    intent. The system event proves the pointer was set — without it this
+      //    test would pass vacuously.
+      mockFetch({ ok: true })
+      const vaibotCmd = (api as any).__commands['vaibot']
+      expect(vaibotCmd, 'the /vaibot command should be registered').toBeTruthy()
+      await vaibotCmd.handler({ args: 'approve sha256:replay1' })
+      expect((api as any).__systemEvents.length).toBeGreaterThan(0)
+
+      // 3. Now engage containment and re-issue the SAME call. The replay pointer
+      //    is live and would otherwise short-circuit the chain.
+      writeRecord({ contained: true, reason: 'engaged after the approval', at: new Date().toISOString() })
+      globalThis.fetch = (() => { throw new Error('containment must not make a network call') }) as any
+      const second = await handler(baseEvent, baseCtx)
+      expect(second?.block).toBe(true)
+      expect(second?.blockReason).toMatch(/containment engaged/i)
+      expect(second?.blockReason).toMatch(/engaged after the approval/)
+    } finally {
+      globalThis.fetch = originalFetch
+      delete process.env.VAIBOT_API_KEY
+    }
   })
 
   it('only a literal true engages it', async () => {
