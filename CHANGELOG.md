@@ -5,6 +5,17 @@ All notable changes to `@vaibot/circuit-breaker-openclaw-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **A denied guard approval is no longer auto-retried.** The poller read "no longer on
+  the pending list" as "approved", but that list is pending-only, so **denied**,
+  **expired** and already-**used** approvals leave it too. After a "No" the agent was told
+  "approval resolved — retrying", and the guard then blocked the retry. On a guard with
+  the `approval-status` capability (guard 2.3.1, read from `/health`), the poller now
+  asks `POST /v1/approvals/status` what each id resolved to:
+  - only `approved` is retried;
+  - `denied`, `used`, `expired` and `unknown` are dropped and logged;
+  - an id the reply leaves out, or a failed status call, stays pending for the next poll.
+
+  An older guard without the capability keeps the previous behaviour.
 - **Guard approvals work again.** When the guard escalated a call, the plugin read the
   approval's id, expiry and scope from the **top level** of the response, but the guard
   returns them **inside `decision`**, and always has. On a real guard all three came
