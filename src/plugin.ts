@@ -88,6 +88,11 @@ type BootstrapResponse = {
 type GuardDecision = {
   decision: "allow" | "deny" | "approve";
   reason?: string;
+  // On an escalation the guard mints an approval record and puts its id, expiry
+  // and scope HERE, inside `decision` — not at the top level of the response.
+  approvalId?: string;
+  expiresAt?: string;
+  scope?: { paramsHash?: string };
 };
 
 type GuardToolDecideResponse = {
@@ -1268,11 +1273,17 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
 
           if (decision.decision === "approve") {
             if (guardObserveOnly) { observeAllow("guard", decision); return; }
-            // Bug #4 fix: Guard returns approvalId/expiresAt/scope at the top level of raw,
-            // NOT nested inside raw.decision
-            const approvalId = raw?.approvalId as string | undefined;
-            const expiresAt = raw?.expiresAt as string | undefined;
-            const paramsHash = raw?.scope?.paramsHash as string | undefined;
+            // The guard's tool-decide response carries approvalId/expiresAt/scope
+            // INSIDE `decision` (`{ ok, runId, risk, decision: { decision, reason,
+            // approvalId, expiresAt, scope }, … }`) — and always has. Reading them
+            // from the top level ("Bug #4 fix") found nothing on a real guard: the
+            // pending entry had no approvalId, so the poller never auto-retried,
+            // approvedByParamsHash was never set, so a retry never presented the
+            // approval, and the block message never showed which id to approve.
+            // The test mock had the wrong shape too. Top level is kept as a fallback.
+            const approvalId = (decision.approvalId ?? raw?.approvalId) as string | undefined;
+            const expiresAt = (decision.expiresAt ?? raw?.expiresAt) as string | undefined;
+            const paramsHash = (decision.scope?.paramsHash ?? raw?.scope?.paramsHash) as string | undefined;
             const expMs = expiresAt ? Date.parse(expiresAt) : Date.now() + cfg.approvalReplayWindowMs;
             const decisionId = approvalId ?? raw?.runId ?? intentHash;
             const idempotencyKey = `${intentHash}:${decisionId}`;

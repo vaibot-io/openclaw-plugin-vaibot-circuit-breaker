@@ -726,7 +726,7 @@ describe('createCircuitBreaker integration', () => {
 
   // ---- Guard approval flow (Bug #4, #15) ----
 
-  it('guard approve extracts approvalId/expiresAt/scope from top-level raw', async () => {
+  it('guard approve extracts approvalId/expiresAt/scope from decision (the real guard shape)', async () => {
     process.env.VAIBOT_API_KEY = 'test-token'
     const api = makeApi()
     const { createCircuitBreaker } = await import('./plugin.js')
@@ -736,11 +736,12 @@ describe('createCircuitBreaker integration', () => {
       { ok: true }, // guard health
       { // guard decide: approval_required
         ok: true,
-        decision: { decision: 'approve', reason: 'Needs human review' },
+        // The real guard shape: approvalId/expiresAt/scope live INSIDE decision.
+        decision: {
+          decision: 'approve', reason: 'Needs human review',
+          approvalId: 'appr_123', expiresAt: '2026-12-31T00:00:00Z', scope: { paramsHash: 'sha256:abc' },
+        },
         runId: 'guard_run_1',
-        approvalId: 'appr_123',
-        expiresAt: '2026-12-31T00:00:00Z',
-        scope: { paramsHash: 'sha256:abc' },
       },
     )
 
@@ -750,6 +751,43 @@ describe('createCircuitBreaker integration', () => {
     expect(res.blockReason).toContain('approvalId=appr_123')
     expect(res.blockReason).toContain('expiresAt=2026-12-31T00:00:00Z')
     expect(res.blockReason).toContain('/guard approve appr_123')
+  })
+
+  // A real guard returns the approval INSIDE decision. Reading it from the top
+  // level found nothing, so a retry never presented the approval and the guard
+  // escalated again under a new id. The retry must carry the approval it got.
+  it('guard approval: a retry of the same call presents the approvalId it was blocked with', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    // The scope a real guard computes for this call: sha256 over the stable JSON
+    // of { toolName, params } — the same hash the plugin derives on the retry.
+    const { createHash } = await import('node:crypto')
+    const paramsHash = `sha256:${createHash('sha256').update('{"params":{"path":"/tmp/a"},"toolName":"write"}').digest('hex')}`
+    const escalate = {
+      ok: true,
+      runId: 'guard_run_esc',
+      decision: {
+        decision: 'approve', reason: 'Needs human review',
+        approvalId: 'appr_live', expiresAt: '2026-12-31T00:00:00Z', scope: { paramsHash },
+      },
+    }
+    const allow = { ok: true, runId: 'guard_run_retry', decision: { decision: 'allow', reason: 'Approved by user' } }
+    // Health is answered with { ok: true } wherever the plugin asks for it.
+    const fetchMock = mockFetch({ ok: true }, escalate, { ok: true }, allow, { ok: true }, { ok: true })
+
+    const handler = (api as any).__handlers['before_tool_call']
+    const first = await handler(baseEvent, baseCtx)
+    expect(first.block).toBe(true)
+    expect(first.blockReason).toContain('approvalId=appr_live')
+
+    await handler({ ...baseEvent, toolCallId: 't2' }, baseCtx)
+    const decides = fetchMock.mock.calls.filter(([url]: any[]) => String(url).endsWith('/v1/decide/tool'))
+    expect(decides.length).toBe(2)
+    expect(JSON.parse(decides[0][1].body).approval).toBeUndefined()
+    expect(JSON.parse(decides[1][1].body).approval).toEqual({ approvalId: 'appr_live' })
   })
 
   // ---- MCP approval flow ----

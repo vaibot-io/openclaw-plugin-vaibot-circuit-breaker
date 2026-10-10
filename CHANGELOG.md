@@ -2,6 +2,30 @@
 
 All notable changes to `@vaibot/circuit-breaker-openclaw-plugin`.
 
+## [Unreleased]
+
+### Fixed
+- **Guard approvals work again.** When the guard escalated a call, the plugin read the
+  approval's id, expiry and scope from the **top level** of the response, but the guard
+  returns them **inside `decision`**, and always has. On a real guard all three came
+  back `undefined`:
+  - the pending entry had no `approvalId`, so the poller skipped it and **never
+    auto-retried** after an approval;
+  - `approvedByParamsHash` was never set, so a **retry never presented the approval**,
+    and the guard escalated again under a new id;
+  - the block message never showed `approvalId=` or `/guard approve <id>`, so the user
+    couldn't see what to approve.
+
+  The plugin now reads them from `decision`, with the top level kept as a fallback. The
+  test mock had the same wrong shape, which is how this got through. It now matches a
+  real guard, and a new test checks that a retry presents the approval it was blocked
+  with.
+
+  Known follow-up: the poller still treats "no longer pending" as "approved". With
+  approvals now visible, a **denied** approval triggers an auto-retry that the guard
+  then blocks (`status=denied`). That's safe but noisy. A proper fix needs a guard
+  endpoint that reports a single approval's status.
+
 ## [1.3.2] — 2026-09-28 — guard 2.3.0
 
 ### Changed
