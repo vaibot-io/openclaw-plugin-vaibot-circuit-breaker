@@ -906,6 +906,53 @@ describe('createCircuitBreaker integration', () => {
     expect(JSON.parse(decides[1][1].body).approval).toEqual({ approvalId: 'appr_live' })
   })
 
+  // The guard's scope hash covers the params as SENT (truncated past maxParamChars,
+  // undefined keys dropped, {} with sendToolParams off), so it can differ from the
+  // plugin's hash of the full call. The retry must still present the approval, and
+  // only for the identical call.
+  async function heldThenRetried(overrides: any, firstEvent: any, retryEvent: any) {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi(overrides)
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+    const escalate = {
+      ok: true,
+      runId: 'guard_run_esc',
+      decision: {
+        decision: 'approve', reason: 'Needs human review',
+        approvalId: 'appr_scope', expiresAt: '2099-01-01T00:00:00Z', scope: { paramsHash: 'sha256:as-the-guard-saw-it' },
+      },
+    }
+    const allow = { ok: true, runId: 'guard_run_retry', decision: { decision: 'allow', reason: 'Approved by user' } }
+    const fetchMock = mockFetch({ ok: true }, escalate, { ok: true }, allow, { ok: true }, { ok: true })
+    const handler = (api as any).__handlers['before_tool_call']
+    expect((await handler(firstEvent, baseCtx)).block).toBe(true)
+    await handler(retryEvent, baseCtx)
+    const decides = fetchMock.mock.calls.filter(([url]: any[]) => String(url).endsWith('/v1/decide/tool'))
+    return JSON.parse(decides[1][1].body).approval
+  }
+
+  it('guard approval: a retry presents it when the params carry an undefined key', async () => {
+    const ev = { toolName: 'write', params: { path: '/tmp/a', mode: undefined }, runId: 'r1', toolCallId: 't1' }
+    expect(await heldThenRetried({}, ev, { ...ev, toolCallId: 't2' })).toEqual({ approvalId: 'appr_scope' })
+  })
+
+  it('guard approval: a retry presents it when the params were truncated for the guard', async () => {
+    const ev = { toolName: 'write', params: { path: '/tmp/a', content: 'x'.repeat(5000) }, runId: 'r1', toolCallId: 't1' }
+    expect(await heldThenRetried({}, ev, { ...ev, toolCallId: 't2' })).toEqual({ approvalId: 'appr_scope' })
+  })
+
+  it('guard approval: a retry presents it when tool params are not sent to the guard', async () => {
+    const ev = { toolName: 'write', params: { path: '/tmp/a' }, runId: 'r1', toolCallId: 't1' }
+    expect(await heldThenRetried({ sendToolParams: false }, ev, { ...ev, toolCallId: 't2' })).toEqual({ approvalId: 'appr_scope' })
+  })
+
+  it('guard approval: a DIFFERENT call that the guard would see identically does not present it', async () => {
+    const ev = { toolName: 'write', params: { path: '/tmp/a', content: 'x'.repeat(5000) }, runId: 'r1', toolCallId: 't1' }
+    const other = { ...ev, toolCallId: 't2', params: { path: '/tmp/a', content: 'x'.repeat(4999) + 'y' } }
+    expect(await heldThenRetried({}, ev, other)).toBeUndefined()
+  })
+
   // ---- Approval poller: what an approval that left the pending list resolved to ----
   // /v1/approvals/list is PENDING only, so "missing" may mean approved OR denied /
   // used / expired. Reading it as approved auto-retried refusals. With the guard's

@@ -579,8 +579,13 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
 
   async function decideWithGuard(event: PluginHookBeforeToolCallEvent, ctx: PluginHookAgentContext) {
     const sessionId = toSessionId(ctx);
-    const paramsHash = `sha256:${await sha256Hex(stableStringify({ toolName: event.toolName, params: event.params ?? {} }))}`;
-    const approvalId = approvedByParamsHash.get(paramsHash);
+    // The plugin's own key for THIS exact call, over the full params. A held
+    // call's approval is stored under it (not under the guard's scope hash, which
+    // is computed over the params as sent: truncated past maxParamChars, without
+    // undefined keys, or {} when sendToolParams is off), so only an identical
+    // call presents the approval, and an identical call always finds it.
+    const callHash = `sha256:${await sha256Hex(stableStringify({ toolName: event.toolName, params: event.params ?? {} }))}`;
+    const approvalId = approvedByParamsHash.get(callHash);
 
     const payload: any = {
       sessionId,
@@ -607,9 +612,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       reason: raw?.error || "Guard did not return a decision",
     }) as GuardDecision;
 
-    if (approvalId) approvedByParamsHash.delete(paramsHash);
+    if (approvalId) approvedByParamsHash.delete(callHash);
 
-    return { decision, raw };
+    return { decision, raw, callHash };
   }
 
   function getApiKey(): string {
@@ -1310,7 +1315,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           const guardOk = await checkGuardHealth();
           if (!guardOk) throw new Error("Guard health check failed (skill missing or unhealthy)");
 
-          const { decision, raw } = await decideWithGuard(event, ctx);
+          const { decision, raw, callHash } = await decideWithGuard(event, ctx);
           // Guard-published account mode is authoritative on this ONLINE guard path;
           // fall back to the local cfg.mode-derived observeOnly only when the guard
           // is older/silent (effective_mode absent). Other sources (mcp/api) and the
@@ -1357,9 +1362,10 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             const idempotencyKey = `${intentHash}:${decisionId}`;
             const pendingKey = approvalId ?? idempotencyKey;
 
-            // Bug #15 fix: populate approvedByParamsHash so guard approval replay works
-            if (approvalId && paramsHash) {
-              approvedByParamsHash.set(paramsHash, approvalId);
+            // Bug #15 fix: populate approvedByParamsHash so guard approval replay works.
+            // Keyed on the plugin's own hash of this call — the key the retry looks up.
+            if (approvalId) {
+              approvedByParamsHash.set(callHash, approvalId);
             }
 
             pending.set(pendingKey, {
