@@ -911,7 +911,7 @@ describe('createCircuitBreaker integration', () => {
   // used / expired. Reading it as approved auto-retried refusals. With the guard's
   // approval-status capability the poller asks, and only `approved` is retried.
 
-  function routedGuard({ capabilities = ['approval-status'], status = 'approved', statusFails = false, omit = false }: any = {}) {
+  function routedGuard({ capabilities = ['approval-status'], status = 'approved', statusFails = false, omit = false, expiresAt = '2099-01-01T00:00:00Z' }: any = {}) {
     const calls: string[] = []
     const fn = vi.fn(async (url: any, init: any) => {
       const u = String(url)
@@ -919,7 +919,7 @@ describe('createCircuitBreaker integration', () => {
       const reply = (body: any) => ({ status: 200, text: async () => JSON.stringify(body) })
       if (u.endsWith('/health')) return reply({ ok: true, capabilities })
       if (u.endsWith('/v1/decide/tool')) {
-        return reply({ ok: true, runId: 'run_poll', decision: { decision: 'approve', reason: 'Needs human review', approvalId: 'appr_poll', expiresAt: '2099-01-01T00:00:00Z', scope: { paramsHash: 'sha256:x' } } })
+        return reply({ ok: true, runId: 'run_poll', decision: { decision: 'approve', reason: 'Needs human review', approvalId: 'appr_poll', expiresAt, scope: { paramsHash: 'sha256:x' } } })
       }
       if (u.endsWith('/v1/approvals/list')) return reply({ ok: true, approvals: [] }) // it left the pending list
       if (u.endsWith('/v1/approvals/status')) {
@@ -970,6 +970,128 @@ describe('createCircuitBreaker integration', () => {
       await vi.advanceTimersByTimeAsync(1001)
       expect((api as any).__systemEvents.length).toBe(0)
     } finally { vi.useRealTimers() }
+  })
+
+  // ---- Guard runs of blocked calls are settled (the gateway fires no after_tool_call) ----
+
+  const guardFinalizes = (fn: any) =>
+    fn.mock.calls
+      .filter(([u]: any) => String(u).endsWith('/v1/finalize/tool'))
+      .map(([, init]: any) => JSON.parse(init.body))
+
+  it('a guard deny finalizes its run as blocked, with no approval answer', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi()
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const fetchMock = mockFetch(
+      { ok: true }, // guard health
+      { ok: true, decision: { decision: 'deny', reason: 'policy deny' }, runId: 'g_deny' },
+      { ok: true }, // finalize
+    )
+
+    const res = await (api as any).__handlers['before_tool_call'](baseEvent, baseCtx)
+    expect(res).toEqual({ block: true, blockReason: 'policy deny' })
+    const [fin] = guardFinalizes(fetchMock)
+    expect(fin.runId).toBe('g_deny')
+    expect(fin.result).toMatchObject({ ok: false, outcome: 'blocked' })
+    expect(fin.result.approval).toBeUndefined()
+  })
+
+  it('a guard approval hold is not finalized at decide time', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi()
+    const g = routedGuard()
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const res = await (api as any).__handlers['before_tool_call'](baseEvent, baseCtx)
+    expect(res.block).toBe(true)
+    expect(guardFinalizes(g.fn)).toEqual([])
+  })
+
+  it('poller: a DENIED guard approval settles the original run as a person\'s denial', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      const g = routedGuard({ status: 'denied' })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect(guardFinalizes(g.fn)).toEqual([expect.objectContaining({ runId: 'run_poll', result: { ok: false, approval: 'denied' } })])
+      await vi.advanceTimersByTimeAsync(1001)
+      expect(guardFinalizes(g.fn).length).toBe(1) // settled once
+    } finally { vi.useRealTimers() }
+  })
+
+  it('poller: an EXPIRED guard approval settles the run as expired on a guard that understands it', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      const g = routedGuard({ status: 'expired', capabilities: ['approval-status', 'approval-resolutions'] })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect(guardFinalizes(g.fn)).toEqual([expect.objectContaining({ runId: 'run_poll', result: { ok: false, approval: 'expired' } })])
+    } finally { vi.useRealTimers() }
+  })
+
+  it('poller: an EXPIRED approval is left open on a guard without approval-resolutions', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      const g = routedGuard({ status: 'expired' })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect(guardFinalizes(g.fn)).toEqual([])
+    } finally { vi.useRealTimers() }
+  })
+
+  it('poller: an APPROVED guard approval does not finalize the original run (the replay redeems it)', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      const g = routedGuard({ status: 'approved', capabilities: ['approval-status', 'approval-resolutions'] })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect(guardFinalizes(g.fn)).toEqual([])
+    } finally { vi.useRealTimers() }
+  })
+
+  it('poller: a guard approval that lapses locally settles the run as expired', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      const g = routedGuard({ expiresAt: new Date(Date.now() + 500).toISOString(), capabilities: ['approval-status', 'approval-resolutions'] })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect(guardFinalizes(g.fn)).toEqual([expect.objectContaining({ runId: 'run_poll', result: { ok: false, approval: 'expired' } })])
+      expect((api as any).__systemEvents.length).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('/guard deny settles the held call\'s run as a person\'s denial', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const registered: Array<{ name: string; handler: (ctx: any) => any }> = []
+    const api = makeApi()
+    ;(api as any).registerCommand = (cmd: any) => { registered.push({ name: cmd.name, handler: cmd.handler }) }
+    const g = routedGuard()
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    await (api as any).__handlers['before_tool_call'](baseEvent, baseCtx)
+    const out = await registered.find((c) => c.name === 'guard')!.handler({ args: 'deny appr_poll' })
+    expect(out.text).toBe('Denied appr_poll.')
+    expect(guardFinalizes(g.fn)).toEqual([expect.objectContaining({ runId: 'run_poll', result: { ok: false, approval: 'denied' } })])
   })
 
   it('poller: an older guard without approval-status keeps the previous retry behaviour', async () => {
