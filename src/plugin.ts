@@ -93,6 +93,9 @@ type GuardDecision = {
   approvalId?: string;
   expiresAt?: string;
   scope?: { paramsHash?: string };
+  // The un-overridable catastrophic floor (Tier-0: the classifier's catastrophic
+  // verdict, or containment). It blocks in EVERY mode, observe included.
+  floor?: boolean;
 };
 
 type GuardToolDecideResponse = {
@@ -622,6 +625,32 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   }
 
   /**
+   * The catastrophic floor's block, shared by every local path (chain exhausted,
+   * breaker tripped) so they cannot drift apart. Un-approvable: no approval id.
+   */
+  function floorBlock(
+    toolName: string,
+    verdict: { reasons?: string[] },
+  ): { block: true; blockReason: string } {
+    return {
+      block: true,
+      blockReason: `VAIBot floor — ${toolName} blocked (${verdict.reasons?.[0] ?? "catastrophic action"}), enforced with no reachable governance.`,
+    };
+  }
+
+  /** Observe mode lets everything through but the floor; say so when it bites. */
+  function logFloorInObserve(source: string, toolName: string): void {
+    api.logger.warn?.(
+      `vaibot-circuitbreaker [observe]: ${source} — catastrophic floor blocks ${toolName} (enforced in every mode)`,
+    );
+  }
+
+  /** The local classifier's catastrophic verdict — the same floor the guard applies. */
+  function onLocalFloor(event: PluginHookBeforeToolCallEvent): boolean {
+    return classify({ tool: event.toolName, input: event.params ?? {} }).verdictHint === "deny";
+  }
+
+  /**
    * Local classifier floor — the terminal fallback when NO server-backed source
    * (guard/mcp/api) could decide: the guard is unreachable, and/or there's no API key
    * so mcp/api can't run (the keyless case). This is IDENTICAL in spirit to the
@@ -633,7 +662,8 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
    *                                                       recover via `vaibot login`)
    *   ambiguous / risky                                → HELD for human approval
    *
-   * Returns `undefined` to allow, or a block decision. Observe mode always passes.
+   * Returns `undefined` to allow, or a block decision. Observe mode passes
+   * everything EXCEPT the catastrophic floor, which blocks in every mode.
    */
   function localFloorDecision(
     event: PluginHookBeforeToolCallEvent,
@@ -645,26 +675,22 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     const verdict = classify({ tool: event.toolName, input: event.params ?? {} });
     const isDenied = cfg.breakerDenylist.includes(event.toolName);
 
-    if (observeOnly) {
+    if (observeOnly && verdict.verdictHint !== "deny") {
       const v = isDenied
         ? "would block (denylist)"
-        : verdict.verdictHint === "deny"
-          ? "would block (floor)"
-          : verdict.verdictHint === "allow"
-            ? "would allow (classifier-safe)"
-            : "would hold for approval";
+        : verdict.verdictHint === "allow"
+          ? "would allow (classifier-safe)"
+          : "would hold for approval";
       api.logger.info?.(`vaibot-circuitbreaker [observe]: ${label} — ${v} ${event.toolName}`);
       return undefined;
     }
 
-    if (isDenied) {
+    if (isDenied && !observeOnly) {
       return { block: true, blockReason: `VAIBot ${label} — denylisted tool: ${event.toolName}` };
     }
     if (verdict.verdictHint === "deny") {
-      return {
-        block: true,
-        blockReason: `VAIBot floor — ${event.toolName} blocked (${verdict.reasons?.[0] ?? "catastrophic action"}), enforced with no reachable governance.`,
-      };
+      if (observeOnly) logFloorInObserve(label, event.toolName);
+      return floorBlock(event.toolName, verdict);
     }
     if (verdict.verdictHint === "allow") {
       api.logger.info?.(`vaibot-circuitbreaker: ${label} — classifier pass-through (${verdict.risk}) for ${event.toolName}`);
@@ -1212,7 +1238,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       const verdict = classify({ tool: event.toolName, input: event.params ?? {} });
       const isDenied = cfg.breakerDenylist.includes(event.toolName);
 
-      if (observeOnly) {
+      if (observeOnly && verdict.verdictHint !== "deny") {
         const v = isDenied
           ? "would block (denylist)"
           : verdict.verdictHint === "allow"
@@ -1222,8 +1248,15 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
         return;
       }
 
-      if (isDenied) {
+      if (isDenied && !observeOnly) {
         return { block: true, blockReason: `Circuit breaker active — denylisted tool: ${event.toolName}` };
+      }
+
+      // The catastrophic floor blocks outright, in every mode — it is never held
+      // for approval (the same un-approvable block as the chain-exhausted path).
+      if (verdict.verdictHint === "deny") {
+        if (observeOnly) logFloorInObserve("breaker tripped", event.toolName);
+        return floorBlock(event.toolName, verdict);
       }
 
       if (verdict.verdictHint === "allow") {
@@ -1355,8 +1388,10 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             };
           }
 
-          // deny
-          if (guardObserveOnly) { observeAllow("guard", decision); return; }
+          // deny — except the catastrophic floor (`floor:true`), which blocks in
+          // every mode, observe included.
+          if (guardObserveOnly && decision.floor !== true) { observeAllow("guard", decision); return; }
+          if (guardObserveOnly) logFloorInObserve("guard", event.toolName);
           return {
             block: true,
             blockReason: decision.reason || `Denied by VAIBot-Guard for tool: ${event.toolName}`,
@@ -1429,8 +1464,11 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             };
           }
 
-          // deny
-          if (observeOnly) { observeAllow("mcp", decision); return; }
+          // deny — except the catastrophic floor, which blocks in every mode. MCP
+          // carries no floor marker, so the local classifier (the same floor the
+          // guard applies) decides.
+          if (observeOnly && !onLocalFloor(event)) { observeAllow("mcp", decision); return; }
+          if (observeOnly) logFloorInObserve("mcp", event.toolName);
           activeRuns.delete(key);
           await finalizeBlock(raw?.run_id, "blocked", `Plugin enforced: deny — ${decision.reason ?? event.toolName}`);
           return {
@@ -1505,8 +1543,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
             };
           }
 
-          // deny
-          if (observeOnly) { observeAllow("api", decision); return; }
+          // deny — except the catastrophic floor (see the mcp branch above).
+          if (observeOnly && !onLocalFloor(event)) { observeAllow("api", decision); return; }
+          if (observeOnly) logFloorInObserve("api", event.toolName);
           activeRuns.delete(key);
           await finalizeBlock(raw?.run_id, "blocked", `Plugin enforced: deny — ${decision.reason ?? event.toolName}`);
           return {
@@ -1534,8 +1573,14 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
       }
     }
 
-    // Chain exhausted without a clear allow. In observe, always pass through.
+    // Chain exhausted without a clear allow. In observe, pass through — except the
+    // catastrophic floor, which blocks in every mode.
     if (observeOnly) {
+      const verdict = classify({ tool: event.toolName, input: event.params ?? {} });
+      if (verdict.verdictHint === "deny") {
+        logFloorInObserve("chain exhausted", event.toolName);
+        return floorBlock(event.toolName, verdict);
+      }
       api.logger.info?.(`vaibot-circuitbreaker [observe]: chain exhausted for ${event.toolName} — passing through`);
       if (replayOf) replayByIntentHash.delete(intentHash);
       return;

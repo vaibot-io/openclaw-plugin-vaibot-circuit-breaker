@@ -5,6 +5,22 @@ All notable changes to `@vaibot/circuit-breaker-openclaw-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **Observe mode no longer lets the catastrophic floor through.** The guard marks a
+  catastrophic deny `floor: true` and expects every client to block it in every mode.
+  This plugin never read the marker, so in observe mode such a call was logged as "would
+  deny" and then ran. Every observe pass-through now honours the floor:
+  - **guard:** a deny with `floor: true` blocks. Other denies are still only logged.
+  - **mcp / api:** their answer has no floor marker, so a deny blocks when the local
+    classifier rates the call catastrophic, the same floor the guard applies. The run
+    is finalized `blocked`, as in enforce.
+  - **breaker tripped / chain exhausted:** a catastrophic call blocks with the existing
+    "VAIBot floor — … blocked" reason.
+
+  Everything below the floor still behaves as before in observe: logged, not blocked.
+  The block reasons are the existing enforce ones; no wording changed.
+- **With the breaker tripped, a catastrophic call is no longer approvable** (enforce).
+  It was held for `/guard approve` like any risky call. It now blocks outright, matching
+  the chain-exhausted path and the claudecode/codex guard-down floor.
 - **A denied guard approval is no longer auto-retried.** The poller read "no longer on
   the pending list" as "approved", but that list is pending-only, so **denied**,
   **expired** and already-**used** approvals leave it too. After a "No" the agent was told
