@@ -5,6 +5,13 @@ All notable changes to `@vaibot/circuit-breaker-openclaw-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **Guard-path blocks and holds get a closing receipt.** These calls never run, so
+  the plugin now closes the guard run itself, as it already did on the mcp/api paths:
+  - a guard deny is recorded `blocked`;
+  - a call held for approval is recorded when the approval is answered: as a person's
+    denial when it's refused (dashboard, API or `/guard deny`), and as `expired` when it
+    lapses. `expired` is sent only to a guard that advertises `approval-resolutions`.
+  - an approved call is recorded by its replay, as before.
 - **Observe mode no longer lets the catastrophic floor through.** The guard marks a
   catastrophic deny `floor: true` and expects every client to block it in every mode.
   This plugin never read the marker, so in observe mode such a call was logged as "would
