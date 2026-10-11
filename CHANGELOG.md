@@ -5,6 +5,11 @@ All notable changes to `@vaibot/circuit-breaker-openclaw-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **An approved guard call is replayed reliably.** The plugin now keys a held call's
+  approval on its own hash of the exact call, the same key the retry looks up. A retry
+  of the identical call presents its approval whatever form the guard received the
+  params in: truncated past `maxParamChars`, with `undefined` values, or not sent at
+  all (`sendToolParams: false`). Only the identical call presents it.
 - **Observe mode no longer lets the catastrophic floor through.** The guard marks a
   catastrophic deny `floor: true` and expects every client to block it in every mode.
   This plugin never read the marker, so in observe mode such a call was logged as "would
