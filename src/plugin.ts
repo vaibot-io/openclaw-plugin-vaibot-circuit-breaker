@@ -8,6 +8,7 @@ import type {
 import { createHash } from "node:crypto";
 import { hostname, userInfo, homedir } from "node:os";
 import { join } from "node:path";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import {
   loadCredsForEnv,
   saveCredsForEnv,
@@ -425,7 +426,7 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   const replayByIntentHash = new Map<string, { contentHash: string; expiresAt: number }>();
 
   const stateDir = api.runtime.state.resolveStateDir();
-  const statePath = `${stateDir}/circuit-breaker-openclaw-plugin.json`;
+  const statePath = join(stateDir, "circuit-breaker-openclaw-plugin.json");
   let lastTripLogged = false;
 
   // Auto-bootstrap state. Seed from saved credentials so restarts reuse the same
@@ -438,10 +439,20 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   let bootstrapPromise: Promise<void> | null = null;
   const nudgedSessions = new Set<string>();
 
+  // Breaker state lives in the plugin's OWN file under the host state dir.
+  // Never api.runtime.config: that is OpenClaw's main-config writer/reader
+  // (`writeConfigFile(cfg, options)`, async), and handing it a path rewrites
+  // openclaw.json. Written atomically (tmp + rename), only when it changed.
+  let lastPersisted = "";
   function persistBreakerState() {
     try {
-      const snap = breaker.snapshot();
-      api.runtime.config.writeConfigFile(statePath, snap as any);
+      const body = JSON.stringify(breaker.snapshot());
+      if (body === lastPersisted) return;
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      const tmp = `${statePath}.${process.pid}.tmp`;
+      writeFileSync(tmp, body + "\n", { mode: 0o600 });
+      renameSync(tmp, statePath);
+      lastPersisted = body;
     } catch (err) {
       api.logger.warn?.(`vaibot-circuitbreaker: failed to persist breaker state (${String(err)})`);
     }
@@ -449,10 +460,14 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
 
   function loadBreakerState() {
     try {
-      const state = api.runtime.config.loadConfig(statePath) as any;
-      breaker.load(state ?? undefined);
+      const raw = readFileSync(statePath, "utf-8");
+      const state = JSON.parse(raw);
+      if (state && typeof state === "object" && !Array.isArray(state)) {
+        breaker.load(state);
+        lastPersisted = JSON.stringify(breaker.snapshot());
+      }
     } catch {
-      // ignore
+      // missing or unreadable → start closed
     }
   }
 
