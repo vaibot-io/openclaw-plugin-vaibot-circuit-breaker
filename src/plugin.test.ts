@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import * as os from 'node:os'
 import { __test, CircuitBreaker } from './plugin.js'
 
 describe('helpers', () => {
@@ -289,10 +290,12 @@ describe('createCircuitBreaker integration', () => {
     return {
       pluginConfig: { ...baseCfg, ...overrides },
       runtime: {
-        state: { resolveStateDir: () => '/tmp' },
+        // A private state dir per api, so breaker state never touches the real /tmp.
+        state: { resolveStateDir: (() => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'vaibot-oc-state-')); return () => d })() },
+        // OpenClaw's MAIN-config writer/reader: the plugin must never call them.
         config: {
-          writeConfigFile: () => {},
-          loadConfig: () => ({})
+          writeConfigFile: vi.fn(async () => {}),
+          loadConfig: vi.fn(() => ({}))
         },
         system: { enqueueSystemEvent: (...args: any[]) => { systemEvents.push(args) } }
       },
@@ -500,6 +503,66 @@ describe('createCircuitBreaker integration', () => {
   })
 
   // ---- #2 shadow_decision preference ----
+
+  // ---- Breaker state persists to the plugin's own file, never via OpenClaw's config ----
+
+  const tripBreaker = async (api: any) => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network down')) as any
+    await api.__handlers['before_tool_call'](baseEvent, baseCtx)
+  }
+
+  it('breaker state never goes through OpenClaw\'s main-config writer or reader', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['api'], breakerFailureThreshold: 1 })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+    await tripBreaker(api)
+    mockFetch({ ok: true, run_id: 'a1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' })
+    await (api as any).__handlers['before_tool_call']({ ...baseEvent, toolCallId: 't2' }, baseCtx)
+    expect((api as any).runtime.config.writeConfigFile).not.toHaveBeenCalled()
+    expect((api as any).runtime.config.loadConfig).not.toHaveBeenCalled()
+  })
+
+  it('a tripped breaker is written to its own state file and survives a restart', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api1 = makeApi({ decisionChain: ['api'], breakerFailureThreshold: 1 })
+    const stateDir = (api1 as any).runtime.state.resolveStateDir()
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api1 as any).register()
+    await tripBreaker(api1)
+
+    const saved = JSON.parse(fs.readFileSync(path.join(stateDir, 'circuit-breaker-openclaw-plugin.json'), 'utf-8'))
+    expect(typeof saved.trippedAt).toBe('number')
+    expect(fs.readdirSync(stateDir).filter((f) => f.endsWith('.tmp'))).toEqual([]) // atomic: no temp file left
+
+    // A new instance (gateway restart) on the same state dir starts tripped:
+    // it decides locally and never calls out.
+    const api2 = makeApi({ decisionChain: ['api'], breakerFailureThreshold: 1 })
+    ;(api2 as any).runtime.state.resolveStateDir = () => stateDir
+    createCircuitBreaker(api2 as any).register()
+    const fetch2 = vi.fn()
+    globalThis.fetch = fetch2 as any
+    await (api2 as any).__handlers['before_tool_call']({ ...baseEvent, toolCallId: 't3' }, baseCtx)
+    expect(fetch2).not.toHaveBeenCalled()
+    expect((api2 as any).__logs.some((l: any) => /breaker is TRIPPED/.test(l.msg))).toBe(true)
+  })
+
+  it('a corrupt breaker state file is ignored (breaker starts closed)', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['api'] })
+    const stateDir = (api as any).runtime.state.resolveStateDir()
+    fs.writeFileSync(path.join(stateDir, 'circuit-breaker-openclaw-plugin.json'), '{not json')
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+    const fetchMock = mockFetch({ ok: true, run_id: 'a1', decision: { decision: 'allow', reason: 'ok' }, content_hash: 'h' })
+    expect(await (api as any).__handlers['before_tool_call'](baseEvent, baseCtx)).toBeUndefined()
+    expect(fetchMock).toHaveBeenCalled()
+  })
+
+  it('the plugin source never calls api.runtime.config (OpenClaw\'s main config)', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'plugin.ts'), 'utf-8')
+    expect(src).not.toMatch(/runtime\.config\.(writeConfigFile|loadConfig)\s*\(/)
+  })
 
   // ---- The catastrophic floor (Tier-0) blocks in EVERY mode, observe included ----
 
@@ -1560,10 +1623,12 @@ describe('auto-bootstrap and claim nudge', () => {
     return {
       pluginConfig: { ...baseCfg, credsDir: testCredsDir, ...overrides },
       runtime: {
-        state: { resolveStateDir: () => '/tmp' },
+        // A private state dir per api, so breaker state never touches the real /tmp.
+        state: { resolveStateDir: (() => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'vaibot-oc-state-')); return () => d })() },
+        // OpenClaw's MAIN-config writer/reader: the plugin must never call them.
         config: {
-          writeConfigFile: () => {},
-          loadConfig: () => ({})
+          writeConfigFile: vi.fn(async () => {}),
+          loadConfig: vi.fn(() => ({}))
         },
         system: { enqueueSystemEvent: () => {} }
       },

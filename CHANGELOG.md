@@ -5,6 +5,12 @@ All notable changes to `@vaibot/circuit-breaker-openclaw-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **Breaker state is kept in the plugin's own state file.** The circuit breaker's
+  state (recent failures, trip time) is written atomically to
+  `circuit-breaker-openclaw-plugin.json` in OpenClaw's state directory and read back
+  from it on start, so a tripped breaker survives a gateway restart. The plugin no
+  longer uses OpenClaw's runtime config API for it; that API is for OpenClaw's own
+  configuration. The bundled SDK types now describe that API's real signature.
 - **An approved guard call is replayed reliably.** The plugin now keys a held call's
   approval on its own hash of the exact call, the same key the retry looks up. A retry
   of the identical call presents its approval whatever form the guard received the

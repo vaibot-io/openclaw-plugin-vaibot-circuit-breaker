@@ -3,9 +3,12 @@ declare module "openclaw/plugin-sdk" {
     pluginConfig: Record<string, unknown>;
     runtime: {
       state: { resolveStateDir: () => string };
+      // OpenClaw's MAIN config (openclaw.json), not a general-purpose store:
+      // writeConfigFile replaces it with `cfg`. Plugin state belongs in its own
+      // file under state.resolveStateDir().
       config: {
-        writeConfigFile: (path: string, data: unknown) => void;
-        loadConfig: (path: string) => unknown;
+        writeConfigFile: (cfg: Record<string, unknown>, options?: Record<string, unknown>) => Promise<void>;
+        loadConfig: () => unknown;
       };
       system: {
         enqueueSystemEvent: (text: string, opts: { sessionKey?: string; agentId?: string }) => void;
