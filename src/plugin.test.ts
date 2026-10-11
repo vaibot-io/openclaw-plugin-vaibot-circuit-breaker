@@ -790,6 +790,118 @@ describe('createCircuitBreaker integration', () => {
     expect(JSON.parse(decides[1][1].body).approval).toEqual({ approvalId: 'appr_live' })
   })
 
+  // ---- Approval poller: what an approval that left the pending list resolved to ----
+  // /v1/approvals/list is PENDING only, so "missing" may mean approved OR denied /
+  // used / expired. Reading it as approved auto-retried refusals. With the guard's
+  // approval-status capability the poller asks, and only `approved` is retried.
+
+  function routedGuard({ capabilities = ['approval-status'], status = 'approved', statusFails = false, omit = false }: any = {}) {
+    const calls: string[] = []
+    const fn = vi.fn(async (url: any, init: any) => {
+      const u = String(url)
+      calls.push(u)
+      const reply = (body: any) => ({ status: 200, text: async () => JSON.stringify(body) })
+      if (u.endsWith('/health')) return reply({ ok: true, capabilities })
+      if (u.endsWith('/v1/decide/tool')) {
+        return reply({ ok: true, runId: 'run_poll', decision: { decision: 'approve', reason: 'Needs human review', approvalId: 'appr_poll', expiresAt: '2099-01-01T00:00:00Z', scope: { paramsHash: 'sha256:x' } } })
+      }
+      if (u.endsWith('/v1/approvals/list')) return reply({ ok: true, approvals: [] }) // it left the pending list
+      if (u.endsWith('/v1/approvals/status')) {
+        if (statusFails) throw new Error('guard unreachable')
+        const ids = JSON.parse(init.body).approvalIds
+        return reply({ ok: true, approvals: omit ? [] : ids.map((approvalId: string) => ({ approvalId, status })) })
+      }
+      return reply({ ok: true, receipts: [] })
+    })
+    globalThis.fetch = fn as any
+    return { fn, calls }
+  }
+
+  async function blockThenPoll(api: any) {
+    const handler = (api as any).__handlers['before_tool_call']
+    const res = await handler(baseEvent, baseCtx)
+    expect(res.block).toBe(true)
+    await vi.advanceTimersByTimeAsync(1001)
+  }
+
+  it('poller: an approval the guard reports approved is auto-retried', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      const g = routedGuard({ status: 'approved' })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect(g.calls.some((u) => u.endsWith('/v1/approvals/status'))).toBe(true)
+      expect((api as any).__systemEvents.length).toBe(1)
+      expect(String((api as any).__systemEvents[0][0])).toContain('retrying blocked action')
+    } finally { vi.useRealTimers() }
+  })
+
+  it('poller: a DENIED approval is not auto-retried', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      routedGuard({ status: 'denied' })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect((api as any).__systemEvents.length).toBe(0)
+      expect((api as any).__logs.some((l: any) => /resolved denied — not retrying/.test(l.msg))).toBe(true)
+      // and it is settled: a later poll does not retry it either
+      await vi.advanceTimersByTimeAsync(1001)
+      expect((api as any).__systemEvents.length).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('poller: an older guard without approval-status keeps the previous retry behaviour', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      const g = routedGuard({ capabilities: [] })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect(g.calls.some((u) => u.endsWith('/v1/approvals/status'))).toBe(false)
+      expect((api as any).__systemEvents.length).toBe(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('poller: an id the status reply leaves out stays pending and is asked about again', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      routedGuard({ omit: true })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect((api as any).__systemEvents.length).toBe(0)
+      routedGuard({ status: 'approved' })
+      await vi.advanceTimersByTimeAsync(1001)
+      expect((api as any).__systemEvents.length).toBe(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('poller: if the status call fails, the approval stays pending and is retried once known', async () => {
+    vi.useFakeTimers()
+    try {
+      process.env.VAIBOT_API_KEY = 'test-token'
+      const api = makeApi({ approvalAutoRetry: true, approvalPollMs: 1000 })
+      routedGuard({ statusFails: true })
+      const { createCircuitBreaker } = await import('./plugin.js')
+      createCircuitBreaker(api as any).register()
+      await blockThenPoll(api)
+      expect((api as any).__systemEvents.length).toBe(0)
+      routedGuard({ status: 'approved' })
+      await vi.advanceTimersByTimeAsync(1001)
+      expect((api as any).__systemEvents.length).toBe(1)
+    } finally { vi.useRealTimers() }
+  })
+
   // ---- MCP approval flow ----
 
   it('MCP approve blocks with content_hash', async () => {

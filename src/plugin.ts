@@ -458,6 +458,8 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
 
   let guardHealthOk: boolean | null = null;
   let guardHealthTs = 0;
+  // What the guard advertised on /health (e.g. "approval-status"), refreshed with it.
+  let guardCapabilities = new Set<string>();
 
   function runKey(ctx: PluginHookAgentContext, event: PluginHookBeforeToolCallEvent | PluginHookAfterToolCallEvent): string {
     const session = toSessionId(ctx);
@@ -530,8 +532,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     if (guardHealthOk !== null && now - guardHealthTs < 5000) return guardHealthOk;
     guardHealthTs = now;
     try {
-      const res = await getJson<{ ok?: boolean }>(`${resolveGuardTarget().baseUrl}/health`, cfg.timeoutMs, getGuardAuthHeaders());
+      const res = await getJson<{ ok?: boolean; capabilities?: unknown }>(`${resolveGuardTarget().baseUrl}/health`, cfg.timeoutMs, getGuardAuthHeaders());
       guardHealthOk = !!res?.ok;
+      guardCapabilities = new Set(Array.isArray(res?.capabilities) ? res.capabilities.filter((c): c is string => typeof c === "string") : []);
     } catch {
       guardHealthOk = false;
     }
@@ -1025,21 +1028,53 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     for (const key of expiredBreakerKeys) breakerPending.delete(key);
     if (pending.size === 0) return;
 
-    // Guard approvals: if approvalId no longer pending, assume approved (best-effort)
+    // Guard approvals. /v1/approvals/list returns PENDING only, so an id that left
+    // it may have been approved — or denied, used, or expired. Reading "missing" as
+    // "approved" auto-retried refusals ("approval resolved — retrying", then the
+    // guard blocked the retry as denied). A guard with the `approval-status`
+    // capability says what each id resolved to; only `approved` is retried.
     try {
       const res = await postJson<any>(`${resolveGuardTarget().baseUrl}/v1/approvals/list`, {}, cfg.timeoutMs, getGuardAuthHeaders());
       const pendingIds = new Set((res?.approvals ?? []).map((a: any) => a.approvalId));
-      const resolvedGuard: PendingAction[] = [];
+      const leftPending: PendingAction[] = [];
       for (const p of pending.values()) {
         if (!p.approvalId) continue;
-        if (!pendingIds.has(p.approvalId)) resolvedGuard.push(p);
+        if (!pendingIds.has(p.approvalId)) leftPending.push(p);
       }
-      for (const p of resolvedGuard) {
-        pending.delete(p.key);
-        enqueueAutoRetry(p);
+      if (leftPending.length > 0) {
+        if (guardCapabilities.has("approval-status")) {
+          const st = await postJson<any>(
+            `${resolveGuardTarget().baseUrl}/v1/approvals/status`,
+            { approvalIds: leftPending.map((p) => p.approvalId).slice(0, 100) },
+            cfg.timeoutMs,
+            getGuardAuthHeaders(),
+          );
+          const statusById = new Map<string, string>(
+            (st?.approvals ?? []).map((a: any) => [String(a.approvalId), String(a.status)]),
+          );
+          for (const p of leftPending) {
+            const status = statusById.get(p.approvalId as string);
+            if (status === undefined) continue; // not answered this round — ask again next poll
+            pending.delete(p.key);
+            if (status === "approved") {
+              enqueueAutoRetry(p);
+            } else {
+              // denied / used / expired / unknown: nothing to retry. `unknown` is
+              // never a live approval (the guard only prunes terminal records).
+              api.logger.info?.(`vaibot-circuitbreaker: approval ${p.approvalId} for ${p.toolName} resolved ${status} — not retrying`);
+            }
+          }
+        } else {
+          // Older guard: no way to tell approved from refused. Keep the previous
+          // best-effort behaviour; a refused retry is still blocked by the guard.
+          for (const p of leftPending) {
+            pending.delete(p.key);
+            enqueueAutoRetry(p);
+          }
+        }
       }
     } catch {
-      // ignore guard poll failures
+      // ignore guard poll failures — entries stay pending for the next poll
     }
 
     // API approvals: check receipts for approved status
