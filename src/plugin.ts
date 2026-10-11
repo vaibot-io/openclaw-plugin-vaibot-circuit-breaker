@@ -925,6 +925,34 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
   }
 
   /**
+   * Finalize a guard run that the gateway will never finalize: a blocked call
+   * fires no `after_tool_call`. `result` must say how it ended — a gated run
+   * finalized without an `approval` answer reads as approved-and-ran.
+   */
+  async function finalizeGuardRun(runId: string | undefined, sessionId: string, result: Record<string, unknown>) {
+    if (!runId) return;
+    try {
+      await postJson(
+        `${resolveGuardTarget().baseUrl}/v1/finalize/tool`,
+        { sessionId, runId, result, ts: Date.now() },
+        cfg.timeoutMs,
+        getGuardAuthHeaders(),
+      );
+    } catch (err) {
+      api.logger.warn?.(`vaibot-circuitbreaker: guard block finalize failed (${String(err)})`);
+    }
+  }
+
+  /** Settle a held guard call's original run once its approval is refused or lapses. */
+  async function settleHeldGuardRun(p: PendingAction, how: "denied" | "expired") {
+    if (!p.runId) return;
+    // "expired" is only understood by a guard that advertises it; an older guard
+    // would record the call as approved and run, so leave the run open there.
+    if (how === "expired" && !guardCapabilities.has("approval-resolutions")) return;
+    await finalizeGuardRun(p.runId, String(p.sessionId || p.sessionKey || "unknown-session"), { ok: false, approval: how });
+  }
+
+  /**
    * Synthetic finalize for the block paths in onBeforeToolCall. When we return
    * `{ block: true }` the gateway never fires `after_tool_call`, so the server
    * would be left with a dangling decide. Posting finalize here closes the loop
@@ -1044,7 +1072,11 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
     for (const [key, p] of pending) {
       if (p.expiresAt <= now) expiredKeys.push(key);
     }
-    for (const key of expiredKeys) pending.delete(key);
+    for (const key of expiredKeys) {
+      const p = pending.get(key);
+      pending.delete(key);
+      if (p?.approvalId) await settleHeldGuardRun(p, "expired");
+    }
 
     // Expire stale breaker-local approvals too
     const expiredBreakerKeys: string[] = [];
@@ -1088,6 +1120,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
               // denied / used / expired / unknown: nothing to retry. `unknown` is
               // never a live approval (the guard only prunes terminal records).
               api.logger.info?.(`vaibot-circuitbreaker: approval ${p.approvalId} for ${p.toolName} resolved ${status} — not retrying`);
+              // A guard approval is refused by a person (dashboard, API or
+              // `/guard deny`), so `denied` is a person's answer.
+              if (status === "denied" || status === "expired") await settleHeldGuardRun(p, status);
             }
           }
         } else {
@@ -1362,6 +1397,9 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
               approvedByParamsHash.set(paramsHash, approvalId);
             }
 
+            // The gateway fires no after_tool_call for a blocked call. The run is
+            // settled from the pending entry once the approval is answered.
+            activeRuns.delete(key);
             pending.set(pendingKey, {
               key: pendingKey,
               toolName: event.toolName,
@@ -1392,6 +1430,12 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           // every mode, observe included.
           if (guardObserveOnly && decision.floor !== true) { observeAllow("guard", decision); return; }
           if (guardObserveOnly) logFloorInObserve("guard", event.toolName);
+          activeRuns.delete(key);
+          await finalizeGuardRun(raw?.runId, toSessionId(ctx), {
+            ok: false,
+            outcome: "blocked",
+            error: clampStr(`Plugin enforced: deny — ${decision.reason ?? event.toolName}`, 2000),
+          });
           return {
             block: true,
             blockReason: decision.reason || `Denied by VAIBot-Guard for tool: ${event.toolName}`,
@@ -1706,12 +1750,11 @@ export function createCircuitBreaker(api: OpenClawPluginApi) {
           const out = await postJson<any>(`${resolveGuardTarget().baseUrl}/v1/approvals/resolve`, { approvalId: a1, action: sub }, cfg.timeoutMs, getGuardAuthHeaders());
           if (!out?.ok) return { text: `Failed: ${out?.error || "unknown"}` };
 
-          if (sub === "approve") {
-            const p = pending.get(a1);
-            if (p) {
-              pending.delete(a1);
-              enqueueAutoRetry(p);
-            }
+          const p = pending.get(a1);
+          if (p) {
+            pending.delete(a1);
+            if (sub === "approve") enqueueAutoRetry(p);
+            else await settleHeldGuardRun(p, "denied");
           }
 
           return { text: `${sub === "approve" ? "Approved" : "Denied"} ${a1}.` };
