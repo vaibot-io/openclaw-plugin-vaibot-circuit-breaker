@@ -501,6 +501,122 @@ describe('createCircuitBreaker integration', () => {
 
   // ---- #2 shadow_decision preference ----
 
+  // ---- The catastrophic floor (Tier-0) blocks in EVERY mode, observe included ----
+
+  // The local classifier rates this catastrophic (verdictHint "deny"). The denylist
+  // is emptied so these tests exercise the floor, not the denylist.
+  const floorEvent = { toolName: 'exec', params: { command: 'rm -rf /' }, runId: 'r1', toolCallId: 'tf1' }
+
+  it('observe: a guard deny marked floor:true still blocks', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ breakerDenylist: [] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    mockFetch(
+      { ok: true }, // guard health
+      { ok: true, decision: { decision: 'deny', reason: 'Classifier: matches destructive pattern', floor: true }, runId: 'g1', effective_mode: 'observe' },
+    )
+
+    const res = await (api as any).__handlers['before_tool_call'](floorEvent, baseCtx)
+    expect(res).toEqual({ block: true, blockReason: 'Classifier: matches destructive pattern' })
+    expect((api as any).__logs.some((l: any) => /observe.*catastrophic floor blocks exec/.test(l.msg))).toBe(true)
+  })
+
+  it('observe: a guard deny WITHOUT floor:true is still only logged', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ breakerDenylist: [] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    mockFetch(
+      { ok: true },
+      { ok: true, decision: { decision: 'deny', reason: 'policy deny', floor: false }, runId: 'g1', effective_mode: 'observe' },
+    )
+
+    expect(await (api as any).__handlers['before_tool_call'](floorEvent, baseCtx)).toBeUndefined()
+  })
+
+  it('observe: an API deny of a catastrophic call blocks, and the run is finalized blocked', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ mode: 'observe', decisionChain: ['api'], breakerDenylist: [] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    const fetchMock = mockFetch(
+      { ok: true, run_id: 'obs_floor_1', decision: { decision: 'deny', reason: 'dangerous' }, content_hash: 'sha256:f1' },
+      { ok: true }, // finalize
+    )
+
+    const res = await (api as any).__handlers['before_tool_call'](floorEvent, baseCtx)
+    expect(res).toEqual({ block: true, blockReason: 'dangerous' })
+    const [finalizeUrl, finalizeInit] = fetchMock.mock.calls[1]
+    expect(finalizeUrl).toContain('/v2/governance/finalize/obs_floor_1')
+    expect(JSON.parse(finalizeInit.body).outcome).toBe('blocked')
+  })
+
+  it('observe: an MCP deny of a catastrophic call blocks', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ mode: 'observe', decisionChain: ['mcp'], breakerDenylist: [] })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    mockFetch(
+      { result: { content: [{ text: 'Decision: deny\nrun_id: m1\ncontent_hash: hash_m1' }] } },
+      { ok: true }, // finalize
+    )
+
+    const res = await (api as any).__handlers['before_tool_call'](floorEvent, baseCtx)
+    expect(res).toMatchObject({ block: true })
+    expect((api as any).__logs.some((l: any) => /observe.*mcp — catastrophic floor blocks exec/.test(l.msg))).toBe(true)
+  })
+
+  it('observe: chain exhausted on a catastrophic call blocks with the floor reason', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ mode: 'observe', decisionChain: ['api'], breakerDenylist: [], breakerFailureThreshold: 99 })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network down')) as any
+    const res = await (api as any).__handlers['before_tool_call'](floorEvent, baseCtx)
+    expect(res).toMatchObject({ block: true })
+    expect(res.blockReason).toMatch(/^VAIBot floor — exec blocked \(matches destructive pattern\)/)
+  })
+
+  it('observe: breaker tripped on a catastrophic call blocks, without calling out', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ mode: 'observe', decisionChain: ['api'], breakerDenylist: [], breakerFailureThreshold: 1 })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network down')) as any
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx) // trips the breaker
+
+    const fetchMock2 = vi.fn()
+    globalThis.fetch = fetchMock2 as any
+    const res = await handler(floorEvent, baseCtx)
+    expect(res).toMatchObject({ block: true })
+    expect(res.blockReason).toMatch(/^VAIBot floor — exec blocked/)
+    expect(fetchMock2).not.toHaveBeenCalled()
+  })
+
+  it('enforce: breaker tripped on a catastrophic call blocks outright, not held for approval', async () => {
+    process.env.VAIBOT_API_KEY = 'test-token'
+    const api = makeApi({ decisionChain: ['api'], breakerDenylist: [], breakerFailureThreshold: 1 })
+    const { createCircuitBreaker } = await import('./plugin.js')
+    createCircuitBreaker(api as any).register()
+
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network down')) as any
+    const handler = (api as any).__handlers['before_tool_call']
+    await handler(baseEvent, baseCtx) // trips the breaker
+
+    const res = await handler(floorEvent, baseCtx)
+    expect(res).toMatchObject({ block: true })
+    expect(res.blockReason).toMatch(/^VAIBot floor — exec blocked/)
+    expect(res.blockReason).not.toMatch(/approve/i)
+  })
+
   it('API path prefers shadow_decision over decision (server-observe-coerced)', async () => {
     process.env.VAIBOT_API_KEY = 'test-token'
     const api = makeApi({ decisionChain: ['api'] })
